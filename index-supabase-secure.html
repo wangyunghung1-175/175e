@@ -1,0 +1,1776 @@
+﻿<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>八福 × 雙福 專案管理系統</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;600;700;900&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"/>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2">
+
+/* ══════════════════════════════════════════════
+   AUTH & RBAC
+══════════════════════════════════════════════ */
+
+// Current session state
+const AUTH = { user: null, role: null, session: null }
+
+const ROLE_LABELS = { admin:'系統管理員', manager:'專案負責人', viewer:'唯讀觀察者' }
+const ROLE_PERMS  = {
+  admin:   { canWrite:true,  canDelete:true,  canSeeRecipients:true,  canSeeAudit:true  },
+  manager: { canWrite:true,  canDelete:false, canSeeRecipients:true,  canSeeAudit:true  },
+  viewer:  { canWrite:false, canDelete:false, canSeeRecipients:false, canSeeAudit:false },
+}
+
+function perm(){ return ROLE_PERMS[AUTH.role] || ROLE_PERMS.viewer }
+
+/* ── Init auth ──────────────────────────────── */
+async function initAuth(){
+  if(USE_MOCK){
+    // Mock mode: skip auth, act as admin
+    AUTH.user  = { email:'mock@demo.com' }
+    AUTH.role  = 'admin'
+    AUTH.session = true
+    onAuthReady()
+    return
+  }
+
+  // Listen for auth state changes
+  sb.auth.onAuthStateChange(async (event, session) => {
+    if(session){
+      AUTH.session = session
+      AUTH.user    = session.user
+      await fetchRole()
+      onAuthReady()
+    } else {
+      AUTH.user = null; AUTH.role = null; AUTH.session = null
+      showAuthScreen()
+    }
+  })
+
+  // Check existing session
+  const { data:{ session } } = await sb.auth.getSession()
+  if(!session) showAuthScreen()
+}
+
+async function fetchRole(){
+  if(USE_MOCK){ AUTH.role='admin'; return }
+  try{
+    const { data } = await sb.from('user_roles').select('role').eq('user_id', AUTH.user.id).single()
+    AUTH.role = data?.role || 'viewer'
+  }catch{ AUTH.role = 'viewer' }
+}
+
+/* ── Show / hide auth screen ────────────────── */
+function showAuthScreen(){
+  $('authScreen').style.display = 'flex'
+  document.querySelectorAll('.sb,.main,.mob').forEach(el=>el.style.display='none')
+}
+
+function hideAuthScreen(){
+  $('authScreen').style.display = 'none'
+  document.querySelectorAll('.sb,.main,.mob').forEach(el=>el.style.display='')
+}
+
+/* ── Login / logout ─────────────────────────── */
+async function doLogin(){
+  const email = $('authEmail').value.trim()
+  const pwd   = $('authPwd').value
+  const errEl = $('authErr')
+  const btn   = $('loginBtn')
+  errEl.classList.remove('show')
+  if(!email || !pwd){ showAuthErr('請填寫電子郵件與密碼'); return }
+  btn.disabled = true; btn.textContent = '登入中…'
+  try{
+    const { error } = await sb.auth.signInWithPassword({ email, password: pwd })
+    if(error) throw error
+    // onAuthStateChange will handle the rest
+  }catch(e){
+    showAuthErr(e.message === 'Invalid login credentials' ? '帳號或密碼錯誤' : e.message)
+    btn.disabled = false; btn.textContent = '登入系統'
+  }
+}
+
+async function doLogout(){
+  if(!confirm('確定要登出？')) return
+  await sb.auth.signOut()
+  // onAuthStateChange will show auth screen
+}
+
+function showAuthErr(msg){
+  const el=$('authErr'); el.textContent=msg; el.classList.add('show')
+}
+
+// Allow Enter key to submit
+document.addEventListener('DOMContentLoaded', ()=>{
+  document.getElementById('authPwd')?.addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin() })
+  document.getElementById('authEmail')?.addEventListener('keydown', e=>{ if(e.key==='Enter') document.getElementById('authPwd')?.focus() })
+})
+
+/* ── After auth ready ───────────────────────── */
+function onAuthReady(){
+  hideAuthScreen()
+  updateRoleBadge()
+  applyRoleUI()
+  loadAll()
+}
+
+function updateRoleBadge(){
+  const badge = $('roleBadge')
+  if(!badge) return
+  badge.style.display = 'flex'
+  const dot = $('roleDot')
+  const nameEl = $('roleName')
+  const emailEl = $('userEmailLbl')
+  if(dot)    { dot.className = `role-dot ${AUTH.role||'viewer'}` }
+  if(nameEl) { nameEl.textContent = ROLE_LABELS[AUTH.role] || '唯讀觀察者' }
+  if(emailEl){ emailEl.textContent = AUTH.user?.email || '' }
+}
+
+function applyRoleUI(){
+  const p = perm()
+  // Show/hide write buttons
+  document.querySelectorAll('.btn-g,.btn-b,.btn-am').forEach(btn=>{
+    if(!p.canWrite) btn.style.display='none'
+  })
+  // Show/hide admin-only nav items
+  document.querySelectorAll('.admin-only').forEach(el=>{
+    el.style.display = p.canSeeAudit ? '' : 'none'
+  })
+}
+
+/* ── Guard write operations ─────────────────── */
+function requireWrite(fn){
+  if(!perm().canWrite){ toast('您的帳號沒有寫入權限','err'); return }
+  fn()
+}
+function requireDelete(fn){
+  if(!perm().canDelete){ toast('您的帳號沒有刪除權限','err'); return }
+  fn()
+}
+
+/* ── Audit log loader ───────────────────────── */
+async function loadAuditLog(){
+  if(!perm().canSeeAudit){ $('auditContent').innerHTML='<div class="no-perm"><div class="np-icon">🔒</div><h3>無存取權限</h3><p>僅管理員與專案負責人可查看審計日誌</p></div>'; return }
+  $('auditContent').innerHTML='<p style="font-size:12px;color:var(--muted)">載入中…</p>'
+  try{
+    let rows
+    if(USE_MOCK){
+      rows = [
+        {created_at:'2024-09-01T10:23:00Z', user_email:'admin@church.org.tw', action:'INSERT', table_name:'plans',     record_id:'P001', new_data:{name:'八福創新社區服務計畫'}},
+        {created_at:'2024-09-02T14:11:00Z', user_email:'manager@church.org.tw',action:'UPDATE', table_name:'kpis',      record_id:'K001', old_data:{current:280}, new_data:{current:312}},
+        {created_at:'2024-09-03T09:05:00Z', user_email:'admin@church.org.tw', action:'INSERT', table_name:'recipients', record_id:'R001', new_data:{name:'陳大明'}},
+        {created_at:'2024-09-04T16:40:00Z', user_email:'manager@church.org.tw',action:'UPDATE', table_name:'budget',    record_id:'BU02', old_data:{spent:250000}, new_data:{spent:295000}},
+        {created_at:'2024-09-05T11:22:00Z', user_email:'admin@church.org.tw', action:'INSERT', table_name:'meetings',   record_id:'M004', new_data:{title:'期末執行成果報告'}},
+      ]
+    }else{
+      const { data, error } = await sb.from('audit_log').select('*').order('created_at',{ascending:false}).limit(100)
+      if(error) throw error
+      rows = data || []
+    }
+    if(!rows.length){ $('auditContent').innerHTML='<p style="font-size:12px;color:var(--muted)">尚無操作記錄</p>'; return }
+    const TABLE_LABELS = {plans:'申請計畫',recipients:'補助對象',kpis:'KPI',budget:'預算',meetings:'會議'}
+    const html = `<div class="audit-wrap"><table class="audit-tbl">
+      <thead><tr><th>時間</th><th>操作者</th><th>動作</th><th>資料表</th><th>記錄 ID</th><th>異動摘要</th></tr></thead>
+      <tbody>${rows.map(r=>{
+        const dt = new Date(r.created_at).toLocaleString('zh-TW',{timeZone:'Asia/Taipei'})
+        const tbl = TABLE_LABELS[r.table_name] || r.table_name
+        let summary = ''
+        if(r.action==='INSERT' && r.new_data) summary = Object.entries(r.new_data).filter(([k])=>['name','title','amount','spent','budgeted'].includes(k)).map(([k,v])=>`${k}: ${v}`).join(' · ')
+        if(r.action==='UPDATE' && r.old_data && r.new_data){
+          const changes = Object.keys(r.new_data).filter(k=>r.old_data[k]!==r.new_data[k]&&k!=='updated_at').map(k=>`${k}: ${r.old_data[k]} → ${r.new_data[k]}`)
+          summary = changes.slice(0,2).join(' · ')
+        }
+        if(r.action==='DELETE' && r.old_data) summary = r.old_data.name || r.old_data.title || ''
+        return `<tr>
+          <td style="white-space:nowrap;font-size:10.5px">${dt}</td>
+          <td style="font-size:10.5px">${esc(r.user_email||'—')}</td>
+          <td><span class="aact ${r.action}">${r.action}</span></td>
+          <td>${esc(tbl)}</td>
+          <td style="font-size:10px;color:var(--faint)">${esc(r.record_id||'—')}</td>
+          <td style="font-size:10.5px;color:var(--muted);max-width:240px">${esc(summary)}</td>
+        </tr>`
+      }).join('')}</tbody>
+    </table></div>`
+    $('auditContent').innerHTML = html
+  }catch(e){ $('auditContent').innerHTML=`<p style="color:var(--red);font-size:12px">載入失敗：${esc(e.message)}</p>` }
+}
+
+</script>
+<style>
+:root{
+  --g1:#14532d;--g2:#166534;--g3:#dcfce7;--g4:#86efac;
+  --b1:#1e3a5f;--b2:#1d4ed8;--b3:#dbeafe;--b4:#93c5fd;
+  --amber:#b45309;--amber2:#f59e0b;--amber3:#fef3c7;
+  --ink:#111827;--ink2:#374151;--muted:#6b7280;--faint:#9ca3af;
+  --border:#e5e7eb;--border2:#d1d5db;
+  --bg:#f9fafb;--bg2:#f3f4f6;--surface:#fff;
+  --red:#dc2626;--red2:#fef2f2;--red3:#fca5a5;
+  --sw:252px;--mh:56px;--r:12px;--rl:18px;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{font-size:15px;scroll-behavior:smooth}
+body{font-family:'Outfit',sans-serif;background:var(--bg);color:var(--ink);min-height:100vh;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+button{font-family:inherit;cursor:pointer;border:none;background:none}
+input,select,textarea{font-family:inherit}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+
+/* ── SIDEBAR ───────────────────────────────── */
+.sb{position:fixed;inset-block:0;left:0;width:var(--sw);background:var(--g1);z-index:200;display:flex;flex-direction:column;overflow:hidden;transition:transform .3s cubic-bezier(.4,0,.2,1)}
+.sb::after{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 140% 50% at 50% 0%,rgba(245,158,11,.08) 0%,transparent 70%);pointer-events:none}
+.sb-top{padding:22px 18px 16px;flex-shrink:0;position:relative;z-index:1}
+.sb-brand{display:flex;align-items:center;gap:11px;margin-bottom:18px}
+.sb-mark{width:40px;height:40px;border-radius:9px;flex-shrink:0;background:linear-gradient(135deg,var(--amber2),#fbbf24);display:flex;align-items:center;justify-content:center;font-family:'Noto Serif TC',serif;font-size:19px;font-weight:900;color:var(--g1);box-shadow:0 3px 12px rgba(245,158,11,.35)}
+.sb-wm .w1{font-family:'Noto Serif TC',serif;font-size:12.5px;font-weight:700;color:#fff;letter-spacing:.3px}
+.sb-wm .w2{font-size:8.5px;color:rgba(255,255,255,.32);letter-spacing:2.5px;margin-top:1px}
+.sb-conn{display:flex;align-items:center;gap:7px;padding:6px 10px;background:rgba(0,0,0,.2);border-radius:7px;border:1px solid rgba(255,255,255,.07)}
+.cdot{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:#fbbf24;box-shadow:0 0 8px #fbbf24;transition:all .3s}
+.cdot.live{background:#4ade80;box-shadow:0 0 8px #4ade80}
+.cdot.err{background:#f87171;box-shadow:0 0 8px #f87171}
+.clbl{font-size:9.5px;color:rgba(255,255,255,.4);letter-spacing:.3px}
+.sb-nav{flex:1;padding:6px 10px;overflow-y:auto;position:relative;z-index:1}
+.nb{display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;border-radius:8px;color:rgba(255,255,255,.48);transition:all .15s;text-align:left;position:relative;font-size:12px;font-weight:500;margin-bottom:1px}
+.nb:hover{background:rgba(255,255,255,.08);color:rgba(255,255,255,.85)}
+.nb.active{background:rgba(255,255,255,.13);color:#fff;font-weight:600}
+.nb.active::before{content:'';position:absolute;left:0;top:50%;transform:translateY(-50%);width:3px;height:16px;background:var(--amber2);border-radius:0 2px 2px 0}
+.ni{font-size:14px;flex-shrink:0;line-height:1;opacity:.85}
+.ns{font-size:8.5px;color:rgba(255,255,255,.26);margin-top:1px;font-weight:400}
+.nb.active .ns{color:rgba(255,255,255,.42)}
+.sb-ft{padding:11px 12px;flex-shrink:0;border-top:1px solid rgba(255,255,255,.07);position:relative;z-index:1}
+.sb-ref{width:100%;padding:7px;border-radius:7px;border:1px solid rgba(255,255,255,.09);background:rgba(0,0,0,.15);color:rgba(255,255,255,.38);font-size:10.5px;display:flex;align-items:center;justify-content:center;gap:6px;transition:all .2s}
+.sb-ref:hover{background:rgba(255,255,255,.08);color:rgba(255,255,255,.7)}
+
+/* ── MOBILE ─────────────────────────────────── */
+.mob{display:none;position:fixed;inset-inline:0;top:0;height:var(--mh);background:var(--g1);z-index:300;align-items:center;justify-content:space-between;padding:0 14px;box-shadow:0 2px 14px rgba(0,0,0,.22)}
+.mob-brand{display:flex;align-items:center;gap:9px}
+.mob-mark{width:30px;height:30px;border-radius:7px;background:linear-gradient(135deg,var(--amber2),#fbbf24);display:flex;align-items:center;justify-content:center;font-family:'Noto Serif TC',serif;font-size:15px;font-weight:900;color:var(--g1)}
+.mob-title{font-family:'Noto Serif TC',serif;font-size:12.5px;font-weight:700;color:#fff}
+.burger{width:33px;height:33px;border-radius:7px;background:rgba(255,255,255,.1);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px}
+.burger span{display:block;width:15px;height:1.5px;background:rgba(255,255,255,.85);border-radius:2px;transition:all .25s}
+.burger.open span:nth-child(1){transform:translateY(5.5px) rotate(45deg)}
+.burger.open span:nth-child(2){opacity:0;transform:scaleX(0)}
+.burger.open span:nth-child(3){transform:translateY(-5.5px) rotate(-45deg)}
+.ovl{display:none;position:fixed;inset:0;background:rgba(0,0,0,.48);z-index:190;backdrop-filter:blur(3px)}
+.ovl.show{display:block}
+
+/* ── MAIN ───────────────────────────────────── */
+.main{margin-left:var(--sw);min-height:100vh;padding:26px 28px}
+.page{display:none}
+.page.active{display:block;animation:fu .26s ease}
+@keyframes fu{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+
+/* ── HERO ───────────────────────────────────── */
+.hero{background:linear-gradient(135deg,var(--g1) 0%,var(--b1) 100%);border-radius:var(--rl);padding:24px 28px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center;gap:18px;flex-wrap:wrap;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;right:-40px;top:-40px;width:200px;height:200px;border-radius:50%;background:radial-gradient(circle,rgba(245,158,11,.12) 0%,transparent 70%);pointer-events:none}
+.hero-l .tag{font-size:9px;font-weight:600;color:var(--amber2);letter-spacing:2.5px;margin-bottom:6px}
+.hero-l h1{font-family:'Noto Serif TC',serif;font-size:17px;font-weight:900;color:#fff;line-height:1.45}
+.hero-l p{font-size:11px;color:rgba(255,255,255,.42);margin-top:4px}
+.hstats{display:flex;gap:20px;flex-wrap:wrap}
+.hs .v{font-family:'Noto Serif TC',serif;font-size:22px;font-weight:900;color:var(--amber2);line-height:1}
+.hs .l{font-size:9.5px;color:rgba(255,255,255,.38);margin-top:3px}
+
+/* ── STAT CARDS ─────────────────────────────── */
+.sr{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}
+.sc{background:var(--surface);border-radius:var(--r);padding:16px 18px;border:1px solid var(--border);transition:box-shadow .2s;position:relative;overflow:hidden}
+.sc:hover{box-shadow:0 4px 18px rgba(0,0,0,.07)}
+.sc::after{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--g1),var(--g2))}
+.sc.bl::after{background:linear-gradient(90deg,var(--b1),var(--b2))}
+.sc.am::after{background:linear-gradient(90deg,var(--amber),var(--amber2))}
+.sc .sv{font-family:'Noto Serif TC',serif;font-size:24px;font-weight:900;color:var(--g1);line-height:1;margin-bottom:3px}
+.sc.bl .sv{color:var(--b2)}
+.sc.am .sv{color:var(--amber)}
+.sc .sl{font-size:11px;color:var(--muted);font-weight:500}
+.sc .ss{font-size:10px;color:var(--amber);font-weight:600;margin-top:2px}
+
+/* ── PAGE HEADER ────────────────────────────── */
+.ph{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:22px;gap:12px;flex-wrap:wrap}
+.ph-l h2{font-family:'Noto Serif TC',serif;font-size:19px;font-weight:900;letter-spacing:-.2px}
+.ph-l p{font-size:11.5px;color:var(--muted);margin-top:3px}
+
+/* ── KANBAN ─────────────────────────────────── */
+.kanban{display:grid;grid-template-columns:repeat(4,1fr);gap:11px;align-items:start}
+.kc{border-radius:var(--r);overflow:hidden;border:1.5px solid}
+.kc.ca{border-color:#c7d2fe;background:#eef2ff}
+.kc.cr{border-color:#fde68a;background:#fffbeb}
+.kc.ce{border-color:#a7f3d0;background:#ecfdf5}
+.kc.cd{border-color:#e2e8f0;background:#f8fafc}
+.kh{padding:10px 12px;border-bottom:1.5px solid;display:flex;justify-content:space-between;align-items:center}
+.kc.ca .kh{border-color:#c7d2fe}.kc.cr .kh{border-color:#fde68a}.kc.ce .kh{border-color:#a7f3d0}.kc.cd .kh{border-color:#e2e8f0}
+.kt{font-size:11.5px;font-weight:700}
+.kc.ca .kt{color:#4338ca}.kc.cr .kt{color:#b45309}.kc.ce .kt{color:#065f46}.kc.cd .kt{color:#475569}
+.kn{font-size:11px;font-weight:700;padding:1px 8px;border-radius:20px;background:#fff;border:1.5px solid}
+.kc.ca .kn{color:#4338ca;border-color:#c7d2fe}.kc.cr .kn{color:#b45309;border-color:#fde68a}.kc.ce .kn{color:#065f46;border-color:#a7f3d0}.kc.cd .kn{color:#475569;border-color:#e2e8f0}
+.kb{padding:9px;display:flex;flex-direction:column;gap:7px;min-height:110px}
+.ke{text-align:center;padding:22px 0;font-size:11.5px;color:var(--faint)}
+
+/* PLAN CARD */
+.pc{background:#fff;border-radius:9px;padding:11px 12px;cursor:pointer;transition:all .15s;border:1.5px solid;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+.kc.ca .pc{border-color:#c7d2fe}.kc.cr .pc{border-color:#fde68a}.kc.ce .pc{border-color:#a7f3d0}.kc.cd .pc{border-color:#e2e8f0}
+.pc:hover{transform:translateY(-2px);box-shadow:0 5px 16px rgba(0,0,0,.1)}
+.ptag{font-size:8.5px;font-weight:700;letter-spacing:1px;padding:2px 6px;border-radius:4px;display:inline-block;margin-bottom:5px;border:1px solid}
+.ptag.bf{color:#166534;background:#dcfce7;border-color:#86efac}
+.ptag.sf{color:#1d4ed8;background:#dbeafe;border-color:#93c5fd}
+.pn{font-size:12px;font-weight:700;line-height:1.4;margin-bottom:2px;color:var(--ink)}
+.pu{font-size:10px;color:var(--muted);margin-bottom:5px}
+.pa{font-family:'Noto Serif TC',serif;font-size:13.5px;font-weight:900}
+.kc.ca .pa{color:#4338ca}.kc.cr .pa{color:#b45309}.kc.ce .pa{color:#065f46}.kc.cd .pa{color:#475569}
+.pd{font-size:9px;color:var(--faint);margin-top:3px}
+.pnote{font-size:9px;color:var(--muted);margin-top:2px;font-style:italic;line-height:1.5}
+
+/* PLAN CARD TOTAL BAR */
+.plan-total-bar{background:#f3f4f6;border-radius:8px;padding:9px 12px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px}
+.plan-total-bar .ptb-item{font-size:11px;color:var(--muted)}
+.plan-total-bar .ptb-item b{color:var(--ink);font-weight:700}
+
+/* ── RECIPIENTS ─────────────────────────────── */
+.rg{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:15px}
+.rc{background:var(--surface);border-radius:var(--rl);overflow:hidden;border:1px solid var(--border);box-shadow:0 1px 6px rgba(0,0,0,.05);transition:box-shadow .2s}
+.rc:hover{box-shadow:0 5px 20px rgba(0,0,0,.08)}
+.rh{padding:16px 18px;position:relative;overflow:hidden}
+.rh.g{background:linear-gradient(135deg,#14532d,#166534bb)}
+.rh.b{background:linear-gradient(135deg,#1e3a5f,#1e40afbb)}
+.rc-cat{font-size:8.5px;font-weight:600;color:rgba(255,255,255,.55);letter-spacing:2px;margin-bottom:3px}
+.rc-name{font-family:'Noto Serif TC',serif;font-size:17px;font-weight:900;color:#fff}
+.rc-church{font-size:10.5px;color:rgba(255,255,255,.6);margin-top:2px}
+.rc-acts{position:absolute;top:12px;right:12px;display:flex;flex-direction:column;gap:5px;align-items:flex-end}
+.rc-stat{font-size:9px;font-weight:600;background:rgba(255,255,255,.17);color:#fff;padding:2px 8px;border-radius:20px}
+.rc-edit{font-size:9.5px;background:rgba(255,255,255,.12);color:#fff;border:1px solid rgba(255,255,255,.22);padding:3px 9px;border-radius:6px;transition:background .2s}
+.rc-edit:hover{background:rgba(255,255,255,.22)}
+.rb{padding:13px 16px}
+.dis{display:inline-flex;align-items:center;gap:4px;background:#eff6ff;color:#1d4ed8;font-size:9.5px;font-weight:600;padding:3px 9px;border-radius:6px;margin-bottom:8px;border:1px solid #bfdbfe}
+.rt{font-size:11px;color:var(--ink2);line-height:1.8;margin-bottom:8px}
+.rdets{border-top:1px solid var(--border);padding-top:8px;display:flex;flex-direction:column;gap:6px}
+.dlbl{font-size:9.5px;font-weight:700;letter-spacing:.4px;margin-bottom:2px}
+.dlbl.g{color:var(--g2)}.dlbl.b{color:var(--b2)}
+.dval{font-size:11px;color:var(--muted);line-height:1.7}
+.expbtn{margin-top:8px;width:100%;padding:6px;border-radius:7px;border:1px solid var(--border);background:var(--bg);color:var(--muted);font-size:10.5px;transition:all .18s}
+.expbtn:hover{background:var(--border);color:var(--ink)}
+
+/* ── KPI ────────────────────────────────────── */
+.kpi-sec{margin-bottom:24px}
+.kpi-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.kpi-hd-l{display:flex;align-items:center;gap:9px}
+.kpi-bar{width:20px;height:4px;border-radius:2px}
+.kpi-lbl{font-size:11.5px;font-weight:700;letter-spacing:.8px}
+.kg{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.kcard{background:var(--surface);border-radius:var(--r);padding:14px 15px;border:1.5px solid var(--border);transition:all .2s;cursor:pointer;position:relative}
+.kcard:hover{box-shadow:0 4px 16px rgba(0,0,0,.07);transform:translateY(-1px)}
+.kcard.warn{border-color:#fca5a5}
+.kcard.good{border-color:#86efac}
+.kcard.ok{border-color:#fde68a}
+.kcard-edit{position:absolute;top:8px;right:8px;font-size:9.5px;background:var(--bg);color:var(--muted);border:1px solid var(--border);padding:2px 7px;border-radius:5px;transition:all .15s;opacity:0}
+.kcard:hover .kcard-edit{opacity:1}
+.kcard-edit:hover{background:var(--ink);color:#fff;border-color:var(--ink)}
+.kwarn{font-size:9.5px;color:#ef4444;font-weight:700;margin-bottom:3px}
+.kname{font-size:10.5px;color:var(--muted);font-weight:600;margin-bottom:3px}
+.kval{display:flex;align-items:baseline;gap:5px;margin-bottom:8px}
+.kcur{font-family:'Noto Serif TC',serif;font-size:23px;font-weight:900}
+.ktgt{font-size:10.5px;color:var(--faint)}
+.pbar{background:#f3f4f6;border-radius:5px;height:5px;overflow:hidden;margin-bottom:4px}
+.pfill{height:100%;border-radius:5px;transition:width 1s cubic-bezier(.4,0,.2,1)}
+.pfill.warn{background:linear-gradient(90deg,#ef4444,#f87171)}
+.pfill.good{background:linear-gradient(90deg,#16a34a,#22c55e)}
+.pfill.ok{background:linear-gradient(90deg,#d97706,#f59e0b)}
+.kfoot{display:flex;justify-content:space-between;font-size:9.5px;color:var(--faint)}
+.kpct{font-weight:700}
+
+/* ── BUDGET ─────────────────────────────────── */
+.bcard{background:var(--surface);border-radius:var(--rl);overflow:hidden;border:1px solid var(--border);box-shadow:0 1px 6px rgba(0,0,0,.04);margin-bottom:18px}
+.bcard-hd{padding:12px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+.btitle{font-family:'Noto Serif TC',serif;font-size:14px;font-weight:800}
+.btitle.g{color:var(--g2)}.btitle.b{color:var(--b2)}
+.bsum{display:flex;gap:14px;font-size:11px;flex-wrap:wrap;align-items:center}
+.bsum b.g{color:var(--g2);font-weight:700}.bsum b.b{color:var(--b2);font-weight:700}
+.bsum b.pos{color:#15803d;font-weight:700}.bsum b.neg{color:#dc2626;font-weight:700}
+table.bt{width:100%;border-collapse:collapse}
+table.bt thead tr{background:#f9fafb}
+table.bt th{padding:7px 11px;font-size:9.5px;color:var(--faint);font-weight:700;letter-spacing:.5px}
+table.bt td{padding:9px 11px;border-bottom:1px solid #f3f4f6;font-size:12px}
+table.bt td.code{font-size:9.5px;color:var(--faint)}
+table.bt td.name{font-weight:600;color:var(--ink)}
+table.bt td.num{text-align:right}
+table.bt td.sp.g{color:var(--g2);font-weight:600}
+table.bt td.sp.b{color:var(--b2);font-weight:600}
+table.bt td.sur.pos{color:#15803d;font-weight:600}
+table.bt td.sur.neg{color:#dc2626;font-weight:600}
+table.bt td.note{font-size:10px;color:var(--muted)}
+table.bt tr:hover{background:#fafafa}
+.brow-edit{font-size:9px;color:var(--muted);background:var(--bg);border:1px solid var(--border);padding:2px 6px;border-radius:4px;transition:all .15s;opacity:0}
+table.bt tr:hover .brow-edit{opacity:1}
+.brow-edit:hover{background:var(--ink);color:#fff;border-color:var(--ink)}
+.mb-wrap{min-width:85px;padding:8px 11px}
+.mb-bg{background:#f3f4f6;border-radius:4px;height:4px;overflow:hidden}
+.mb-fill{height:100%;border-radius:4px}
+.mb-fill.g{background:var(--g2)}.mb-fill.b{background:var(--b2)}.mb-fill.ov{background:#ef4444}
+.mb-lbl{font-size:9px;color:var(--faint);text-align:right;margin-top:2px}
+
+/* ── MEETINGS ───────────────────────────────── */
+.ml{display:flex;flex-direction:column;gap:9px}
+.mc{background:var(--surface);border-radius:var(--r);padding:13px 17px;border:1px solid var(--border);display:flex;gap:13px;align-items:flex-start;box-shadow:0 1px 4px rgba(0,0,0,.04);transition:box-shadow .2s}
+.mc:hover{box-shadow:0 4px 16px rgba(0,0,0,.07)}
+.mdate{width:46px;height:46px;border-radius:10px;flex-shrink:0;display:flex;flex-direction:column;align-items:center;justify-content:center;border:1.5px solid}
+.mmth{font-size:9px;font-weight:700;line-height:1}
+.mday{font-size:15px;font-weight:900;line-height:1.1}
+.mi{flex:1}
+.mtags{display:flex;gap:6px;align-items:center;margin-bottom:4px;flex-wrap:wrap}
+.mproj{font-size:10px;font-weight:700;padding:2px 7px;border-radius:5px}
+.mtyp{font-size:10px;color:var(--muted)}
+.mstat{font-size:10px;font-weight:600;padding:2px 8px;border-radius:20px}
+.mstat.done{background:#dcfce7;color:#15803d}
+.mstat.upcoming{background:#fef9c3;color:#a16207}
+.mstat.pending{background:#f3f4f6;color:#6b7280}
+.mtitle{font-size:13px;font-weight:700;margin-bottom:2px}
+.matt{font-size:10px;color:var(--muted);margin-bottom:3px}
+.msum{font-size:11px;color:var(--ink2);background:var(--bg);padding:6px 10px;border-radius:7px;line-height:1.7}
+.mc-edit{font-size:9.5px;background:var(--bg);color:var(--muted);border:1px solid var(--border);padding:3px 8px;border-radius:6px;flex-shrink:0;transition:all .15s;align-self:flex-start;margin-top:2px}
+.mc-edit:hover{background:var(--ink);color:#fff;border-color:var(--ink)}
+
+/* ── SETUP ──────────────────────────────────── */
+.setup-wrap{max-width:700px}
+.ss-steps{display:flex;flex-direction:column;gap:12px}
+.ss{background:var(--surface);border-radius:var(--r);border:1px solid var(--border);padding:15px 17px;display:flex;gap:12px}
+.sn{width:28px;height:28px;border-radius:50%;flex-shrink:0;background:linear-gradient(135deg,var(--g1),var(--g2));color:#fff;font-size:12.5px;font-weight:800;display:flex;align-items:center;justify-content:center;margin-top:1px}
+.sb2 .st{font-size:13px;font-weight:700;color:var(--ink);margin-bottom:4px}
+.sb2 .sd{font-size:11px;color:var(--ink2);line-height:1.75;margin-bottom:7px}
+.chips{display:flex;gap:5px;flex-wrap:wrap}
+.chip{background:#eff6ff;color:#1d4ed8;font-size:10px;font-weight:700;padding:2px 8px;border-radius:5px;border:1px solid #bfdbfe}
+.code-wrap{background:#0f172a;border-radius:var(--rl);padding:15px 18px;max-width:700px}
+.code-hd{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.code-lang{font-size:9px;color:#475569;font-weight:700;letter-spacing:2px}
+.cpbtn{padding:4px 12px;border-radius:6px;border:1px solid #334155;background:#1e293b;color:#94a3b8;font-size:10px;transition:all .2s}
+.cpbtn:hover{background:#334155;color:#e2e8f0}
+.cpbtn.ok{background:#064e3b;color:#6ee7b7;border-color:#16a34a}
+pre.code{font-family:'Courier New',monospace;font-size:10.5px;color:#7dd3fc;line-height:1.85;overflow:auto;max-height:300px;white-space:pre}
+
+/* ── BUTTONS ────────────────────────────────── */
+.btn{display:inline-flex;align-items:center;gap:7px;padding:8px 18px;border-radius:9px;font-size:12px;font-weight:700;transition:all .18s;white-space:nowrap}
+.btn-g{background:linear-gradient(135deg,var(--g1),var(--g2));color:#fff;box-shadow:0 3px 10px rgba(20,83,45,.25)}
+.btn-g:hover{transform:translateY(-1px);box-shadow:0 5px 16px rgba(20,83,45,.35)}
+.btn-b{background:linear-gradient(135deg,var(--b1),var(--b2));color:#fff;box-shadow:0 3px 10px rgba(30,58,95,.25)}
+.btn-b:hover{transform:translateY(-1px);box-shadow:0 5px 16px rgba(30,58,95,.35)}
+.btn-am{background:linear-gradient(135deg,var(--amber),var(--amber2));color:#fff;box-shadow:0 3px 10px rgba(180,83,9,.22)}
+.btn-am:hover{transform:translateY(-1px)}
+.btn-ghost{background:var(--surface);border:1.5px solid var(--border);color:var(--muted)}
+.btn-ghost:hover{border-color:var(--g1);color:var(--g1)}
+.btn-sm{padding:5px 12px;font-size:11px}
+
+/* ── MODAL ──────────────────────────────────── */
+.mbg{position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.42);backdrop-filter:blur(5px);display:none;align-items:center;justify-content:center;padding:16px}
+.mbg.show{display:flex}
+.mbox{background:var(--surface);border-radius:18px;width:100%;max-width:620px;max-height:90vh;overflow-y:auto;box-shadow:0 28px 64px rgba(0,0,0,.22)}
+.mhdr{position:sticky;top:0;background:var(--surface);padding:16px 20px 13px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;z-index:1}
+.mhdr-l{display:flex;align-items:center;gap:9px}
+.mac{width:4px;height:20px;border-radius:2px}
+.mtit{font-family:'Noto Serif TC',serif;font-size:15.5px;font-weight:900}
+.mclose{width:28px;height:28px;border-radius:50%;background:var(--bg);color:var(--muted);font-size:16px;display:flex;align-items:center;justify-content:center;transition:background .2s}
+.mclose:hover{background:var(--border)}
+.mbody{padding:18px 20px}
+
+/* FORMS */
+.fg{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.ff{display:flex;flex-direction:column;gap:4px}
+.ff.s2{grid-column:1/-1}
+.fl{font-size:10px;font-weight:700;color:var(--muted);letter-spacing:.3px}
+.fl.r::after{content:' *';color:#ef4444}
+.fi,.fs,.fta{width:100%;padding:7px 10px;border:1.5px solid var(--border);border-radius:8px;font-size:12px;color:var(--ink);background:var(--bg);transition:border-color .2s,background .2s}
+.fi:focus,.fs:focus,.fta:focus{border-color:var(--g1);background:#fff;outline:none}
+.fta{resize:vertical;min-height:72px}
+.fas{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+
+/* 計畫連動預覽 */
+.plan-link-box{background:var(--bg);border:1px solid var(--border);border-radius:9px;padding:10px 13px;margin-bottom:10px}
+.plan-link-box .plb-title{font-size:10px;font-weight:700;color:var(--muted);letter-spacing:.5px;margin-bottom:6px}
+.plan-link-row{display:flex;justify-content:space-between;align-items:center;font-size:11px}
+.plan-link-row .plr-l{color:var(--ink2)}
+.plan-link-row .plr-r{font-weight:700;font-family:'Noto Serif TC',serif}
+
+/* ── TOAST ──────────────────────────────────── */
+.toast{position:fixed;bottom:22px;right:22px;z-index:9999;padding:10px 18px;border-radius:10px;font-size:12px;font-weight:700;color:#fff;display:flex;align-items:center;gap:7px;box-shadow:0 7px 24px rgba(0,0,0,.2);transform:translateY(60px);opacity:0;transition:all .26s cubic-bezier(.4,0,.2,1);pointer-events:none}
+.toast.show{transform:none;opacity:1}
+.toast.ok{background:#14532d}.toast.err{background:#7f1d1d}.toast.info{background:#1e3a5f}
+
+/* LOADING */
+.loading{display:flex;flex-direction:column;align-items:center;justify-content:center;height:55vh;gap:13px}
+.spin{width:36px;height:36px;border:2.5px solid var(--border);border-top-color:var(--g1);border-radius:50%;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.loading p{font-size:11.5px;color:var(--muted)}
+
+/* ── RESPONSIVE ─────────────────────────────── */
+@media(max-width:1060px){
+  :root{--sw:215px}
+  .main{padding:20px}
+  .kanban{grid-template-columns:repeat(2,1fr)}
+  .kg{grid-template-columns:repeat(2,1fr)}
+  .sr{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:768px){
+  .mob{display:flex}
+  .sb{transform:translateX(-100%);z-index:280}
+  .sb.open{transform:none}
+  .main{margin-left:0;padding:calc(var(--mh) + 16px) 13px 20px}
+  .hero{padding:16px;flex-direction:column;align-items:flex-start}
+  .sr{grid-template-columns:1fr 1fr}
+  .kanban{grid-template-columns:1fr}
+  .kg{grid-template-columns:1fr 1fr}
+  .rg{grid-template-columns:1fr}
+  .ph{flex-direction:column;align-items:flex-start}
+  .bcard-hd{flex-direction:column;align-items:flex-start}
+  .bwrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .mc{flex-direction:column;gap:9px}
+  .fg{grid-template-columns:1fr}
+  .ff.s2{grid-column:1}
+  .mbg{align-items:flex-end;padding:0}
+  .mbox{border-radius:18px 18px 0 0;max-height:88vh}
+  .toast{left:10px;right:10px;bottom:14px;justify-content:center}
+  .ss{flex-direction:column}
+}
+@media(max-width:480px){
+  .main{padding:calc(var(--mh) + 13px) 10px 18px}
+  .sr{grid-template-columns:1fr}
+  .kg{grid-template-columns:1fr}
+  .hstats{gap:14px}
+}
+
+/* ── AUTH ──────────────────────────────────── */
+.auth-screen{position:fixed;inset:0;z-index:9999;background:linear-gradient(135deg,var(--g1) 0%,var(--b1) 100%);display:flex;align-items:center;justify-content:center;padding:20px}
+.auth-box{background:#fff;border-radius:20px;width:100%;max-width:400px;padding:36px 32px;box-shadow:0 24px 64px rgba(0,0,0,.28)}
+.auth-logo{width:52px;height:52px;border-radius:13px;background:linear-gradient(135deg,var(--amber2),#fbbf24);display:flex;align-items:center;justify-content:center;font-family:'Noto Serif TC',serif;font-size:24px;font-weight:900;color:var(--g1);margin:0 auto 18px;box-shadow:0 4px 16px rgba(245,158,11,.35)}
+.auth-title{font-family:'Noto Serif TC',serif;font-size:19px;font-weight:900;text-align:center;color:var(--ink);margin-bottom:4px}
+.auth-sub{font-size:11px;color:var(--muted);text-align:center;margin-bottom:24px}
+.auth-field{display:flex;flex-direction:column;gap:5px;margin-bottom:13px}
+.auth-label{font-size:10.5px;font-weight:700;color:var(--muted);letter-spacing:.3px}
+.auth-input{width:100%;padding:10px 13px;border:1.5px solid var(--border);border-radius:9px;font-size:13px;color:var(--ink);background:var(--bg);transition:border-color .2s}
+.auth-input:focus{border-color:var(--g1);background:#fff;outline:none}
+.auth-btn{width:100%;padding:11px;border-radius:10px;border:none;background:linear-gradient(135deg,var(--g1),var(--g2));color:#fff;font-size:13px;font-weight:700;cursor:pointer;margin-top:6px;transition:all .2s;box-shadow:0 4px 14px rgba(20,83,45,.28)}
+.auth-btn:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(20,83,45,.36)}
+.auth-btn:disabled{opacity:.6;transform:none;cursor:not-allowed}
+.auth-err{font-size:11.5px;color:#dc2626;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:8px 11px;margin-top:8px;display:none}
+.auth-err.show{display:block}
+.role-badge{margin:0 12px 10px;padding:7px 11px;border-radius:8px;border:1px solid rgba(255,255,255,.1);display:flex;align-items:center;justify-content:space-between}
+.role-info{display:flex;align-items:center;gap:7px}
+.role-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.role-dot.admin{background:#f59e0b;box-shadow:0 0 6px #f59e0b}
+.role-dot.manager{background:#4ade80;box-shadow:0 0 6px #4ade80}
+.role-dot.viewer{background:#93c5fd;box-shadow:0 0 6px #93c5fd}
+.role-text{font-size:9.5px;color:rgba(255,255,255,.45)}
+.role-name{font-size:10.5px;font-weight:700;color:#fff}
+.logout-btn{font-size:9.5px;color:rgba(255,255,255,.4);background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.1);padding:3px 8px;border-radius:5px;transition:all .2s}
+.logout-btn:hover{background:rgba(220,38,38,.2);color:#fca5a5;border-color:rgba(220,38,38,.3)}
+.no-perm{display:flex;flex-direction:column;align-items:center;justify-content:center;height:40vh;gap:12px;text-align:center}
+.no-perm .np-icon{font-size:38px}
+.no-perm h3{font-size:16px;font-weight:700;color:var(--ink)}
+.no-perm p{font-size:12px;color:var(--muted)}
+.audit-wrap{overflow-x:auto}
+.audit-tbl{width:100%;border-collapse:collapse;font-size:11.5px}
+.audit-tbl th{padding:7px 10px;background:var(--bg2);color:var(--muted);font-weight:700;font-size:10px;letter-spacing:.4px;text-align:left;border-bottom:1px solid var(--border)}
+.audit-tbl td{padding:8px 10px;border-bottom:1px solid #f3f4f6;color:var(--ink2)}
+.audit-tbl tr:hover td{background:#fafafa}
+.aact{font-size:9.5px;font-weight:700;padding:2px 7px;border-radius:4px;white-space:nowrap}
+.aact.INSERT{background:#dcfce7;color:#15803d}
+.aact.UPDATE{background:#dbeafe;color:#1d4ed8}
+.aact.DELETE{background:#fee2e2;color:#dc2626}
+
+</style>
+</head>
+<body>
+
+<!-- MOBILE HEADER -->
+
+<!-- AUTH SCREEN -->
+<div class="auth-screen" id="authScreen" style="display:none">
+  <div class="auth-box">
+    <div class="auth-logo">福</div>
+    <div class="auth-title">專案管理系統</div>
+    <div class="auth-sub">八福創新計畫補助 × 雙福傳道補助<br>請使用機構帳號登入</div>
+    <div class="auth-field"><label class="auth-label">電子郵件</label><input class="auth-input" id="authEmail" type="email" placeholder="yourname@church.org.tw" autocomplete="email"/></div>
+    <div class="auth-field"><label class="auth-label">密碼</label><input class="auth-input" id="authPwd" type="password" placeholder="••••••••" autocomplete="current-password"/></div>
+    <button class="auth-btn" id="loginBtn" onclick="doLogin()">登入系統</button>
+    <div class="auth-err" id="authErr"></div>
+    <p style="font-size:10px;color:var(--faint);text-align:center;margin-top:18px">如需帳號請聯絡系統管理員</p>
+  </div>
+</div>
+<header class="mob" id="mob">
+  <div class="mob-brand">
+    <div class="mob-mark">福</div>
+    <span class="mob-title">專案管理系統</span>
+  </div>
+  <button class="burger" id="burger"><span></span><span></span><span></span></button>
+</header>
+<div class="ovl" id="ovl"></div>
+
+<!-- SIDEBAR -->
+<aside class="sb" id="sb">
+  <div class="sb-top">
+    <div class="sb-brand">
+      <div class="sb-mark">福</div>
+      <div class="sb-wm"><div class="w1">專案管理系統</div><div class="w2">DEPT · 175</div></div>
+    </div>
+    <div class="sb-conn">
+      <span class="cdot" id="cdot"></span>
+      <span class="clbl" id="clbl">連線中…</span>
+    </div>
+  </div>
+  <div class="role-badge" id="roleBadge" style="display:none">
+    <div class="role-info"><span class="role-dot" id="roleDot"></span><div><div class="role-name" id="roleName"></div><div class="role-text" id="userEmailLbl"></div></div></div>
+    <button class="logout-btn" onclick="doLogout()">登出</button>
+  </div>
+  <nav class="sb-nav">
+    <button class="nb active" data-p="dash"><span class="ni">🏠</span><div><div>總覽</div><div class="ns">Dashboard</div></div></button>
+    <button class="nb" data-p="pipeline"><span class="ni">📋</span><div><div>申請計畫</div><div class="ns">Kanban 看板</div></div></button>
+    <button class="nb" data-p="recipients"><span class="ni">🙏</span><div><div>雙福補助對象</div><div class="ns">傳道人 / 神學生</div></div></button>
+    <button class="nb" data-p="kpi"><span class="ni">📊</span><div><div>KPI 看板</div><div class="ns">進度監測</div></div></button>
+    <button class="nb" data-p="budget"><span class="ni">💰</span><div><div>預決算管理</div><div class="ns">經費追蹤</div></div></button>
+    <button class="nb" data-p="meetings"><span class="ni">📅</span><div><div>會議紀錄</div><div class="ns">審查 / 報告</div></div></button>
+    <button class="nb admin-only" data-p="audit" style="display:none"><span class="ni">🔐</span><div><div>審計日誌</div><div class="ns">操作記錄</div></div></button>
+    <button class="nb" data-p="setup"><span class="ni">⚙️</span><div><div>Supabase 設定</div><div class="ns">資料庫連線</div></div></button>
+  </nav>
+  <div class="sb-ft"><button class="sb-ref" id="refBtn">↻ 重新整理資料</button></div>
+</aside>
+
+<!-- MAIN -->
+<main class="main">
+  <div class="loading" id="loadingState"><div class="spin"></div><p>正在載入資料…</p></div>
+
+  <!-- DASHBOARD -->
+  <div class="page" id="page-dash">
+    <div class="hero">
+      <div class="hero-l">
+        <div class="tag">2024 年度補助計畫</div>
+        <h1>八福創新計畫補助<br>× 雙福傳道補助</h1>
+        <p>部門代碼 175 ｜ 雙軌並行 · 透明呈現</p>
+      </div>
+      <div class="hstats">
+        <div class="hs"><div class="v" id="hs-b">–</div><div class="l">總申請金額（元）</div></div>
+        <div class="hs"><div class="v" id="hs-p">–</div><div class="l">補助計畫</div></div>
+        <div class="hs"><div class="v" id="hs-r">–</div><div class="l">補助對象</div></div>
+        <div class="hs"><div class="v" id="hs-k">–</div><div class="l">KPI 達成率</div></div>
+      </div>
+    </div>
+    <div class="sr" id="srRow"></div>
+    <div style="margin-bottom:13px;display:flex;justify-content:space-between;align-items:center">
+      <b style="font-family:'Noto Serif TC',serif;font-size:15px">近期 KPI 概況</b>
+      <button class="btn btn-ghost btn-sm" onclick="goPage('kpi')">查看全部 →</button>
+    </div>
+    <div class="kg" id="dashKpi" style="margin-bottom:22px"></div>
+    <div style="margin-bottom:11px;display:flex;justify-content:space-between;align-items:center">
+      <b style="font-family:'Noto Serif TC',serif;font-size:15px">即將召開會議</b>
+      <button class="btn btn-ghost btn-sm" onclick="goPage('meetings')">查看全部 →</button>
+    </div>
+    <div class="ml" id="dashMeet"></div>
+  </div>
+
+  <!-- PIPELINE -->
+  <div class="page" id="page-pipeline">
+    <div class="ph">
+      <div class="ph-l"><h2>補助申請計畫管理</h2><p id="pip-sub">申請 → 審核 → 執行 → 結案 全流程追蹤</p></div>
+      <button class="btn btn-g" onclick="requireWrite(()=>openPlanModal())">＋ 新增申請計畫</button>
+    </div>
+    <!-- 申請金額彙總 -->
+    <div class="plan-total-bar" id="planTotalBar"></div>
+    <div class="kanban" id="kanban"></div>
+  </div>
+
+  <!-- RECIPIENTS -->
+  <div class="page" id="page-recipients">
+    <div class="ph">
+      <div class="ph-l"><h2>雙福傳道補助對象</h2><p id="rec-sub">傳道人與神學生完整資料</p></div>
+      <button class="btn btn-b" onclick="requireWrite(()=>openRecModal())">＋ 新增補助對象</button>
+    </div>
+    <div class="rg" id="rg"></div>
+  </div>
+
+  <!-- KPI -->
+  <div class="page" id="page-kpi">
+    <div class="ph">
+      <div class="ph-l"><h2>KPI 追蹤看板</h2><p>時間進度 68% · 達成率低於 85% 自動預警 · 點擊卡片可編輯</p></div>
+      <button class="btn btn-am" onclick="requireWrite(()=>openKpiModal())">＋ 新增 KPI</button>
+    </div>
+    <div id="kpiContent"></div>
+  </div>
+
+  <!-- BUDGET -->
+  <div class="page" id="page-budget">
+    <div class="ph">
+      <div class="ph-l"><h2>預決算管理</h2><p>八福 × 雙福 經費追蹤 · 點擊列可編輯</p></div>
+      <button class="btn btn-am" onclick="requireWrite(()=>openBudgetModal())">＋ 新增科目</button>
+    </div>
+    <div id="budgetContent"></div>
+  </div>
+
+  <!-- MEETINGS -->
+  <div class="page" id="page-meetings">
+    <div class="ph">
+      <div class="ph-l"><h2>會議紀錄</h2><p>審查小組會議 · 期中期末報告繳交</p></div>
+      <button class="btn btn-am" onclick="requireWrite(()=>openMeetModal())">＋ 新增會議</button>
+    </div>
+    <div class="ml" id="ml"></div>
+  </div>
+
+  <!-- AUDIT LOG -->
+  <div class="page" id="page-audit">
+    <div class="ph">
+      <div class="ph-l"><h2>審計日誌</h2><p>所有資料寫入操作的完整記錄（僅管理員可見）</p></div>
+      <button class="btn btn-ghost btn-sm" onclick="loadAuditLog()">↻ 重新載入</button>
+    </div>
+    <div id="auditContent"><p style="font-size:12px;color:var(--muted)">點擊重新載入查看日誌</p></div>
+  </div>
+
+  <!-- SETUP -->
+  <div class="page" id="page-setup">
+    <div class="ph"><div class="ph-l"><h2>Supabase 設定指南</h2><p>三步驟完成資料庫連線</p></div></div>
+    <div class="setup-wrap"><div class="ss-steps" id="setupSteps"></div></div>
+  </div>
+</main>
+
+<!-- MODAL -->
+<div class="mbg" id="mbg">
+  <div class="mbox">
+    <div class="mhdr">
+      <div class="mhdr-l"><div class="mac" id="mac"></div><span class="mtit" id="mtit"></span></div>
+      <button class="mclose" id="mclose">×</button>
+    </div>
+    <div class="mbody" id="mbody"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* ══════════════════════════════════════════════
+   CONFIG — 修改這裡連接 Supabase
+══════════════════════════════════════════════ */
+const SB_URL = 'https://ypqxjtpzdqaacnmeolju.supabase.co'
+const SB_KEY = 'sb_publishable_Oqzxabjj9256V1PYnVRrWQ_ONaG7uZ5'
+const USE_MOCK = false // false = 使用真實 Supabase
+
+/* ══════════════════════════════════════════════
+   MOCK DATA
+══════════════════════════════════════════════ */
+const MOCK = {
+  plans:[
+    {id:'P001',name:'八福創新社區服務計畫',unit:'信義路長老教會',amount:380000,type:'八福',status:'執行中',apply_date:'2024-01-15',review_date:'2024-02-20',start_date:'2024-03-01',close_date:null,note:'已通過第一次審查'},
+    {id:'P002',name:'原住民部落福音創新計畫',unit:'新北市教會聯合會',amount:250000,type:'八福',status:'審核中',apply_date:'2024-02-01',review_date:null,start_date:null,close_date:null,note:'等待審查小組開會'},
+    {id:'P003',name:'數位宣教創新工具開發',unit:'大安區社區關懷協會',amount:180000,type:'八福',status:'申請中',apply_date:'2024-03-10',review_date:null,start_date:null,close_date:null,note:''},
+    {id:'P004',name:'障礙者社區服務整合計畫',unit:'基督教救助協會',amount:320000,type:'八福',status:'結案',apply_date:'2023-09-01',review_date:'2023-09-20',start_date:'2023-10-01',close_date:'2024-01-31',note:'已完成結案報告'},
+    {id:'P005',name:'青年傳道人培訓計畫',unit:'東門長老教會',amount:150000,type:'雙福',status:'執行中',apply_date:'2024-04-01',review_date:'2024-04-15',start_date:'2024-05-01',close_date:null,note:''},
+    {id:'P006',name:'聾人教會植堂支援計畫',unit:'士林社區服務中心',amount:200000,type:'雙福',status:'審核中',apply_date:'2024-05-10',review_date:null,start_date:null,close_date:null,note:'場地評估中'},
+  ],
+  recipients:[
+    {id:'R001',category:'傳道人',name:'陳大明',church:'東門長老教會',disability:'肢體障礙（第二類）',situation:'陳傳道自幼因小兒麻痺導致肢體障礙，仍堅持牧會服事，目前服事偏鄉社區教會，面臨交通不便與醫療資源不足的挑戰。',gospel1:'2024年3月：與信義路教會合辦「復活節關懷弱勢家庭」，共服事32戶家庭',gospel2:'2024年7月：參與「夏日兒童聖經營」，帶領20位偏鄉兒童認識信仰',prayer:'為陳傳道的健康守望；為偏鄉教會新成員加入代禱；為交通工具需要代禱',status:'補助中'},
+    {id:'R002',category:'神學生',name:'林美玲',church:'台灣基督長老教會總會',disability:'視覺障礙（第一類）',situation:'林同學目前就讀神學院三年級，視力幾近全盲，每月需負擔點字書籍、螢幕閱讀軟體等費用，積極參與校內敬拜服事。',gospel1:'2024年2月：帶領神學院學生前往榮家舉辦「冬日關懷音樂會」，服事約80位長輩',gospel2:'2024年6月：協同在地教會辦理「視障者信仰生命關懷工作坊」，吸引15位學員',prayer:'為林同學神學學業順利完成代禱；為視障輔具經費代禱；為牧會呼召代禱',status:'補助中'},
+    {id:'R003',category:'傳道人',name:'王志強',church:'士林社區服務中心',disability:'聽覺障礙（第二類）',situation:'王傳道天生聽力損失，學習手語後積極服事聾人群體。目前負責籌備聾人教會，面臨多重財務壓力。',gospel1:'2024年4月：舉辦「聾人家庭親子日」，邀請12個聾人家庭共同參與',gospel2:'2024年8月：與台灣聾人福音協會合作辦理「手語敬拜特會」，逾60人出席',prayer:'為聾人教會場地需要代禱；為更多手語傳道人興起代禱；為王傳道家庭健康代禱',status:'補助中'},
+  ],
+  kpis:[
+    {id:'K001',project:'八福',plan_id:'P001',name:'受益人次',target:500,current:312,unit:'人次',updated_at:'2024-09-01'},
+    {id:'K002',project:'八福',plan_id:'P001',name:'辦理場次',target:24,current:18,unit:'場',updated_at:'2024-09-01'},
+    {id:'K003',project:'八福',plan_id:'P002',name:'合作機構數',target:8,current:5,unit:'間',updated_at:'2024-09-01'},
+    {id:'K004',project:'雙福',plan_id:'P005',name:'傳道人次',target:300,current:198,unit:'人次',updated_at:'2024-09-01'},
+    {id:'K005',project:'雙福',plan_id:'P005',name:'補助對象數',target:20,current:12,unit:'人',updated_at:'2024-09-01'},
+    {id:'K006',project:'雙福',plan_id:'P006',name:'福音合作活動',target:24,current:14,unit:'場',updated_at:'2024-09-01'},
+  ],
+  budget:[
+    {id:'BU01',project:'八福',plan_id:'P001',code:'5110',name:'車馬費',   budgeted:120000,spent:78500, note:''},
+    {id:'BU02',project:'八福',plan_id:'P001',code:'5120',name:'勞務費',   budgeted:380000,spent:295000,note:'含2名兼職同工'},
+    {id:'BU03',project:'八福',plan_id:'P002',code:'5210',name:'教育訓練費',budgeted:60000, spent:42000, note:''},
+    {id:'BU04',project:'八福',plan_id:'P002',code:'5220',name:'專家會議費',budgeted:45000, spent:30000, note:''},
+    {id:'BU05',project:'八福',plan_id:'P003',code:'5310',name:'公關費',   budgeted:30000, spent:18700, note:''},
+    {id:'BU06',project:'八福',plan_id:'P001',code:'5410',name:'專案管理費',budgeted:65000, spent:65000, note:'已核銷'},
+    {id:'BU07',project:'雙福',plan_id:'P005',code:'5110',name:'車馬費',   budgeted:90000, spent:71200, note:''},
+    {id:'BU08',project:'雙福',plan_id:'P005',code:'5120',name:'勞務費',   budgeted:250000,spent:187500,note:''},
+    {id:'BU09',project:'雙福',plan_id:'P006',code:'5210',name:'教育訓練費',budgeted:80000, spent:55000, note:'課程教材費用'},
+    {id:'BU10',project:'雙福',plan_id:'P005',code:'5220',name:'專家會議費',budgeted:35000, spent:28000, note:''},
+    {id:'BU11',project:'雙福',plan_id:'P006',code:'5310',name:'公關費',   budgeted:20000, spent:9800,  note:''},
+    {id:'BU12',project:'雙福',plan_id:'P005',code:'5410',name:'專案管理費',budgeted:50000, spent:37500, note:''},
+  ],
+  meetings:[
+    {id:'M001',project:'八福',plan_id:'P001',date:'2024-03-15',type:'審查會議',title:'第一次審查小組會議',attendees:7,status:'completed',summary:'通過3項申請計畫，要求P002補充資料'},
+    {id:'M002',project:'八福',plan_id:'P001',date:'2024-06-20',type:'期中報告',title:'期中執行成果報告',attendees:5,status:'completed',summary:'八福計畫整體進度達62%，符合期程要求'},
+    {id:'M003',project:'八福',plan_id:'P002',date:'2024-09-12',type:'審查會議',title:'第二次審查小組會議',attendees:8,status:'completed',summary:'整體達標，預算執行率78%'},
+    {id:'M004',project:'八福',plan_id:'P001',date:'2024-12-05',type:'成果報告',title:'期末執行成果報告',attendees:0,status:'upcoming',summary:''},
+    {id:'M005',project:'雙福',plan_id:'P005',date:'2024-04-18',type:'審查會議',title:'雙福第一次審查小組會議',attendees:6,status:'completed',summary:'審核3位補助對象資格，全數通過'},
+    {id:'M006',project:'雙福',plan_id:'P005',date:'2024-07-11',type:'期中報告',title:'雙福期中執行成果報告',attendees:5,status:'completed',summary:'整體進度良好，福音合作達成率58%'},
+    {id:'M007',project:'雙福',plan_id:'P006',date:'2024-10-24',type:'審查會議',title:'雙福第三次審查小組會議',attendees:0,status:'upcoming',summary:''},
+    {id:'M008',project:'雙福',plan_id:'P005',date:'2024-12-20',type:'成果報告',title:'雙福期末成果報告',attendees:0,status:'pending',summary:''},
+  ],
+}
+
+/* ══════════════════════════════════════════════
+   STATE & SUPABASE
+══════════════════════════════════════════════ */
+const sb = supabase.createClient(SB_URL, SB_KEY)
+const S = { data:JSON.parse(JSON.stringify(MOCK)), page:'dash', edit:{} }
+
+const $ = id => document.getElementById(id)
+const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+const fmt = n => Number(n||0).toLocaleString('zh-TW')
+const uid = () => Math.random().toString(36).slice(2,8).toUpperCase()
+const delay = ms => new Promise(r=>setTimeout(r,ms))
+
+/* ──────── COMPUTED HELPERS (連動核心) ──────── */
+
+// 申請計畫金額總覽
+function planStats() {
+  const plans = S.data.plans
+  const total = plans.reduce((a,p)=>a+Number(p.amount||0),0)
+  const byStatus = {}
+  plans.forEach(p=>{ byStatus[p.status]=(byStatus[p.status]||0)+Number(p.amount||0) })
+  const byType = {}
+  plans.forEach(p=>{ byType[p.type]=(byType[p.type]||0)+Number(p.amount||0) })
+  return {total, byStatus, byType, count:plans.length}
+}
+
+// 預算與申請計畫的連動：計算各計畫的預算執行情況
+function planBudgetSummary(planId) {
+  const items = S.data.budget.filter(b=>b.plan_id===planId)
+  const budgeted = items.reduce((a,b)=>a+Number(b.budgeted||0),0)
+  const spent = items.reduce((a,b)=>a+Number(b.spent||0),0)
+  return {budgeted, spent, surplus:budgeted-spent, items:items.length}
+}
+
+// KPI 與申請計畫的連動：計算各計畫的 KPI 數量與達成率
+function planKpiSummary(planId) {
+  const items = S.data.kpis.filter(k=>k.plan_id===planId)
+  if(!items.length) return {count:0, avgPct:0}
+  const avgPct = Math.round(items.reduce((a,k)=>a+(k.current/k.target)*100,0)/items.length)
+  return {count:items.length, avgPct}
+}
+
+// 會議與申請計畫的連動
+function planMeetingSummary(planId) {
+  const items = S.data.meetings.filter(m=>m.plan_id===planId)
+  return {count:items.length, upcoming:items.filter(m=>m.status==='upcoming').length}
+}
+
+/* ──────── API ──────── */
+const API = {
+  async get(table){
+    if(USE_MOCK){await delay(300);return JSON.parse(JSON.stringify(MOCK[table]||[]))}
+    const{data,error}=await sb.from(table).select('*').order('id')
+    if(error) throw new Error(error.message||JSON.stringify(error))
+    return data
+  },
+  async insert(table,row){
+    if(USE_MOCK){await delay(250);return{...row}}
+    // Strip out any undefined values
+    const payload=Object.fromEntries(Object.entries(row).filter(([,v])=>v!==undefined))
+    console.log('[INSERT]', table, payload)
+    const{data,error}=await sb.from(table).insert(payload).select()
+    if(error){
+      console.error('[INSERT ERROR]', table, error)
+      // Try upsert as fallback (handles schema cache issues)
+      const{data:d2,error:e2}=await sb.from(table).upsert(payload).select()
+      if(e2) throw new Error(e2.message||JSON.stringify(e2))
+      return d2?.[0]||payload
+    }
+    return data?.[0]||payload
+  },
+  async update(table,id,row){
+    if(USE_MOCK){await delay(250);return row}
+    const payload=Object.fromEntries(Object.entries(row).filter(([,v])=>v!==undefined))
+    console.log('[UPDATE]', table, id, payload)
+    const{data,error}=await sb.from(table).update(payload).eq('id',id).select()
+    if(error){
+      console.error('[UPDATE ERROR]', table, error)
+      throw new Error(error.message||JSON.stringify(error))
+    }
+    return data?.[0]||payload
+  },
+  async remove(table,id){
+    if(USE_MOCK){await delay(200);return true}
+    const{error}=await sb.from(table).delete().eq('id',id)
+    if(error) throw new Error(error.message||JSON.stringify(error))
+    return true
+  }
+}
+
+async function loadAll(){
+  $('loadingState').style.display='flex'
+  try{
+    const[plans,recipients,kpis,budget,meetings]=await Promise.all([
+      API.get('plans'),API.get('recipients'),API.get('kpis'),API.get('budget'),API.get('meetings')
+    ])
+    S.data={plans,recipients,kpis,budget,meetings}
+    setConn(true)
+    // Trigger PostgREST schema cache reload
+    if(!USE_MOCK){ try{ await sb.rpc('reload_schema') }catch(_){} }
+  }catch(e){
+    console.error(e)
+    setConn(false)
+    toast('連線失敗，顯示示範資料','err')
+    S.data=JSON.parse(JSON.stringify(MOCK))
+  }
+  $('loadingState').style.display='none'
+  renderAll()
+}
+
+function setConn(ok){
+  $('cdot').className=`cdot ${ok?(USE_MOCK?'':'live'):'err'}`
+  $('clbl').textContent=ok?(USE_MOCK?'模擬資料模式':'Supabase 已連線'):'連線失敗'
+}
+
+// 診斷工具：測試單一資料表的寫入權限
+async function testWrite(table){
+  toast(`測試 ${table} 寫入中…`,'info')
+  try{
+    const testRow={id:`TEST_${Date.now()}`}
+    const{error}=await sb.from(table).insert(testRow)
+    if(error){
+      console.error(`[TEST ${table}]`,error)
+      toast(`${table} 錯誤：${error.message}`,'err')
+    }else{
+      // cleanup
+      await sb.from(table).delete().eq('id',testRow.id)
+      toast(`${table} 寫入正常 ✓`)
+    }
+  }catch(e){toast(`${table} 例外：${e.message}`,'err')}
+}
+
+/* ──────── TOAST ──────── */
+function toast(msg,type='ok'){
+  const el=$('toast')
+  el.innerHTML=`<span>${type==='ok'?'✓':type==='info'?'ℹ':'✗'}</span><span>${msg}</span>`
+  el.className=`toast show ${type}`
+  clearTimeout(window._tt)
+  window._tt=setTimeout(()=>el.className='toast',3200)
+}
+
+/* ──────── NAV ──────── */
+function goPage(p){
+  document.querySelectorAll('.nb').forEach(b=>b.classList.toggle('active',b.dataset.p===p))
+  document.querySelectorAll('.page').forEach(el=>el.classList.toggle('active',el.id===`page-${p}`))
+  S.page=p; closeSb()
+}
+function closeSb(){$('sb').classList.remove('open');$('ovl').classList.remove('show');$('burger').classList.remove('open');document.body.style.overflow=''}
+function openSb(){$('sb').classList.add('open');$('ovl').classList.add('show');$('burger').classList.add('open');document.body.style.overflow='hidden'}
+
+/* ──────── MODAL ──────── */
+function openModal(title,color,html){
+  $('mtit').textContent=title;$('mac').style.background=color;$('mbody').innerHTML=html
+  $('mbg').classList.add('show');document.body.style.overflow='hidden'
+}
+function closeModal(){$('mbg').classList.remove('show');document.body.style.overflow=''}
+
+/* ══════════════════════════════════════════════
+   RENDER — DASHBOARD
+══════════════════════════════════════════════ */
+function renderDash(){
+  const{plans,recipients,kpis,budget,meetings}=S.data
+  const ps=planStats()
+  const tb=budget.reduce((a,b)=>a+Number(b.budgeted||0),0)
+  const ts=budget.reduce((a,b)=>a+Number(b.spent||0),0)
+  const avgK=kpis.length?Math.round(kpis.reduce((a,k)=>a+(k.current/k.target)*100,0)/kpis.length):0
+
+  // Hero — 申請金額（由計畫金額加總，非預算）
+  $('hs-b').textContent='$'+fmt(ps.total)
+  $('hs-p').textContent=ps.count
+  $('hs-r').textContent=recipients.length
+  $('hs-k').textContent=avgK+'%'
+
+  // Stat cards — 執行中計畫金額、預算結餘、待審核數
+  const execAmt=plans.filter(p=>p.status==='執行中').reduce((a,p)=>a+Number(p.amount||0),0)
+  const pendingCount=plans.filter(p=>p.status==='審核中').length
+  $('srRow').innerHTML=`
+    <div class="sc">
+      <div class="sv">$${fmt(execAmt)}</div>
+      <div class="sl">執行中計畫金額</div>
+      <div class="ss">${plans.filter(p=>p.status==='執行中').length} 個計畫</div>
+    </div>
+    <div class="sc bl">
+      <div class="sv">$${fmt(tb-ts)}</div>
+      <div class="sl">預算結餘</div>
+      <div class="ss">執行率 ${tb>0?Math.round(ts/tb*100):0}%</div>
+    </div>
+    <div class="sc am">
+      <div class="sv">${pendingCount}</div>
+      <div class="sl">待審核計畫</div>
+      <div class="ss">整體達成率 ${avgK}%</div>
+    </div>`
+
+  // KPI mini
+  $('dashKpi').innerHTML=kpis.slice(0,3).map(k=>kpiCard(k,true)).join('')
+
+  // Upcoming meetings
+  const up=meetings.filter(m=>m.status!=='completed').slice(0,3)
+  $('dashMeet').innerHTML=up.length?up.map(m=>meetCard(m,true)).join(''):'<p style="font-size:11.5px;color:var(--muted)">暫無即將召開的會議</p>'
+}
+
+/* ══════════════════════════════════════════════
+   RENDER — PIPELINE（含申請金額連動）
+══════════════════════════════════════════════ */
+function renderPipeline(){
+  const{plans}=S.data
+  const ps=planStats()
+
+  // 申請金額彙總列（連動核心）
+  const bfAmt=ps.byType['八福']||0
+  const sfAmt=ps.byType['雙福']||0
+  const execAmt=(ps.byStatus['執行中']||0)
+  const reviewAmt=(ps.byStatus['審核中']||0)
+  $('planTotalBar').innerHTML=`
+    <div class="ptb-item">總申請金額 <b>$${fmt(ps.total)}</b></div>
+    <div class="ptb-item">八福 <b>$${fmt(bfAmt)}</b></div>
+    <div class="ptb-item">雙福 <b>$${fmt(sfAmt)}</b></div>
+    <div class="ptb-item" style="color:#065f46">執行中 <b>$${fmt(execAmt)}</b></div>
+    <div class="ptb-item" style="color:#b45309">待審核 <b>$${fmt(reviewAmt)}</b></div>`
+
+  $('pip-sub').textContent=`共 ${plans.length} 個計畫 · 總金額 $${fmt(ps.total)}`
+
+  const stages=[{k:'申請中',c:'ca'},{k:'審核中',c:'cr'},{k:'執行中',c:'ce'},{k:'結案',c:'cd'}]
+  $('kanban').innerHTML=stages.map(({k,c})=>{
+    const items=plans.filter(p=>p.status===k)
+    const stageAmt=items.reduce((a,p)=>a+Number(p.amount||0),0)
+    const cards=items.length?items.map(p=>{
+      // 連動：每張卡片顯示該計畫的預算執行情況
+      const bs=planBudgetSummary(p.id)
+      const ks=planKpiSummary(p.id)
+      const ms=planMeetingSummary(p.id)
+      return `<div class="pc" onclick="openPlanModal('${p.id}')">
+        <div class="ptag ${p.type==='八福'?'bf':'sf'}">${esc(p.type)}</div>
+        <div class="pn">${esc(p.name)}</div>
+        <div class="pu">${esc(p.unit)}</div>
+        <div class="pa">申請 $${fmt(p.amount)}</div>
+        ${bs.items>0?`<div style="font-size:9px;color:var(--muted);margin-top:3px">預算 $${fmt(bs.budgeted)} · 支出 $${fmt(bs.spent)}</div>`:''}
+        ${ks.count>0?`<div style="font-size:9px;color:var(--muted);margin-top:1px">KPI ${ks.count} 項 · 達成率 ${ks.avgPct}%</div>`:''}
+        ${ms.count>0?`<div style="font-size:9px;color:var(--muted);margin-top:1px">會議 ${ms.count} 場${ms.upcoming>0?` · <span style="color:#b45309">${ms.upcoming} 場即將召開</span>`:''}</div>`:''}
+        ${p.apply_date?`<div class="pd">申請：${p.apply_date}</div>`:''}
+        ${p.note?`<div class="pnote">${esc(p.note)}</div>`:''}
+      </div>`
+    }).join(''):`<div class="ke">尚無計畫</div>`
+    return `<div class="kc ${c}">
+      <div class="kh">
+        <span class="kt">${k}</span>
+        <div style="display:flex;align-items:center;gap:5px">
+          ${items.length?`<span style="font-size:9px;color:inherit;opacity:.7">$${fmt(stageAmt)}</span>`:''}
+          <span class="kn">${items.length}</span>
+        </div>
+      </div>
+      <div class="kb">${cards}</div>
+    </div>`
+  }).join('')
+}
+
+/* ══════════════════════════════════════════════
+   RENDER — RECIPIENTS
+══════════════════════════════════════════════ */
+function renderRecipients(){
+  if(!USE_MOCK && !perm().canSeeRecipients){
+    $('rg').innerHTML='<div class="no-perm"><div class="np-icon">🔒</div><h3>無存取權限</h3><p>補助對象個資僅供專案負責人與管理員查看</p></div>'
+    return
+  }
+  $('rec-sub').textContent=`共 ${S.data.recipients.length} 位`
+  $('rg').innerHTML=S.data.recipients.map(r=>{
+    const cl=r.category==='傳道人'?'b':'g'
+    const lc=r.category==='傳道人'?'b':'g'
+    const trunc=(s,n)=>(s||'').length>n?(s||'').slice(0,n)+'…':(s||'—')
+    return `<div class="rc">
+      <div class="rh ${cl}">
+        <div><div class="rc-cat">${esc(r.category)}</div><div class="rc-name">${esc(r.name)}</div><div class="rc-church">${esc(r.church)}</div></div>
+        <div class="rc-acts">
+          <span class="rc-stat">${esc(r.status)}</span>
+          <button class="rc-edit" onclick="openRecModal('${r.id}')">✏ 編輯</button>
+        </div>
+      </div>
+      <div class="rb">
+        ${r.disability?`<div class="dis">♿ ${esc(r.disability)}</div>`:''}
+        <div class="rt" id="sit_${r.id}">${esc(trunc(r.situation,120))}</div>
+        <div class="rdets">
+          <div><div class="dlbl ${lc}">🤝 福音合作①</div><div class="dval" id="g1_${r.id}">${esc(trunc(r.gospel1,90))}</div></div>
+          <div><div class="dlbl ${lc}">🤝 福音合作②</div><div class="dval" id="g2_${r.id}">${esc(trunc(r.gospel2,90))}</div></div>
+          <div><div class="dlbl ${lc}">🙏 代禱事項</div><div class="dval" id="pr_${r.id}">${esc(trunc(r.prayer,90))}</div></div>
+        </div>
+        <button class="expbtn" data-open="0" onclick="toggleRec('${r.id}',this)">▼ 展開全文</button>
+      </div>
+    </div>`
+  }).join('')
+}
+
+function toggleRec(id,btn){
+  const r=S.data.recipients.find(x=>x.id===id);if(!r)return
+  const o=btn.dataset.open==='1'
+  btn.dataset.open=o?'0':'1';btn.textContent=o?'▼ 展開全文':'▲ 收起'
+  const tr=(s,n)=>o?((s||'').slice(0,n)+((s||'').length>n?'…':'')):(s||'—')
+  $(`sit_${id}`).textContent=o?tr(r.situation,120):r.situation
+  $(`g1_${id}`).textContent=o?tr(r.gospel1,90):r.gospel1||'—'
+  $(`g2_${id}`).textContent=o?tr(r.gospel2,90):r.gospel2||'—'
+  $(`pr_${id}`).textContent=o?tr(r.prayer,90):r.prayer||'—'
+}
+
+/* ══════════════════════════════════════════════
+   RENDER — KPI（含計畫連動）
+══════════════════════════════════════════════ */
+function kpiCard(k, mini=false){
+  const pct=Math.round((k.current/k.target)*100),tp=68
+  const warn=pct<tp*.85,good=pct>=tp,cls=warn?'warn':good?'good':'ok'
+  const pc=k.project==='八福'?'#14532d':'#1e3a5f'
+  // 連動：取得對應計畫名稱
+  const plan=k.plan_id?S.data.plans.find(p=>p.id===k.plan_id):null
+  return `<div class="kcard ${cls}" ${!mini?`onclick="openKpiModal('${k.id}')" title="點擊編輯"`:''}>
+    ${!mini?`<button class="kcard-edit" onclick="event.stopPropagation();openKpiModal('${k.id}')">✏ 編輯</button>`:''}
+    ${warn?'<div class="kwarn">⚠ 進度落後</div>':''}
+    <div class="kname">${esc(k.name)}${plan?` <span style="font-size:9px;color:var(--faint)">[${esc(plan.name.slice(0,8))}…]</span>`:''}</div>
+    <div class="kval"><span class="kcur" style="color:${pc}">${fmt(k.current)}</span><span class="ktgt">/ ${fmt(k.target)} ${esc(k.unit)}</span></div>
+    <div class="pbar"><div class="pfill ${cls}" style="width:${Math.min(pct,100)}%"></div></div>
+    <div class="kfoot"><span>達成 <span class="kpct" style="color:${warn?'#ef4444':pc}">${pct}%</span></span><span>${k.updated_at||''}</span></div>
+  </div>`
+}
+
+function renderKPI(){
+  $('kpiContent').innerHTML=['八福','雙福'].map(proj=>{
+    const pc=proj==='八福'?'#14532d':'#1e3a5f'
+    const items=S.data.kpis.filter(k=>k.project===proj)
+    // 連動：顯示該專案所有計畫的 KPI 統計
+    const planIds=[...new Set(items.map(k=>k.plan_id).filter(Boolean))]
+    const planSummary=planIds.map(pid=>{
+      const plan=S.data.plans.find(p=>p.id===pid)
+      const ks=planKpiSummary(pid)
+      return plan?`<span style="font-size:10px;color:var(--muted)">${esc(plan.name.slice(0,10))}（${ks.count}項·${ks.avgPct}%）</span>`:''
+    }).filter(Boolean).join(' · ')
+    return `<div class="kpi-sec">
+      <div class="kpi-hd">
+        <div class="kpi-hd-l">
+          <div class="kpi-bar" style="background:${pc}"></div>
+          <span class="kpi-lbl" style="color:${pc}">${proj==='八福'?'八福創新計畫':'雙福傳道補助'}</span>
+          ${planSummary?`<span style="font-size:9.5px;color:var(--faint)">${planSummary}</span>`:''}
+        </div>
+      </div>
+      <div class="kg">${items.map(k=>kpiCard(k)).join('')}</div>
+    </div>`
+  }).join('')
+}
+
+/* ══════════════════════════════════════════════
+   RENDER — BUDGET（含申請計畫連動）
+══════════════════════════════════════════════ */
+function renderBudget(){
+  $('budgetContent').innerHTML=['八福','雙福'].map(proj=>{
+    const cl=proj==='八福'?'g':'b'
+    const pc=proj==='八福'?'#14532d':'#1e3a5f'
+    const items=S.data.budget.filter(b=>b.project===proj)
+    const tb=items.reduce((a,b)=>a+Number(b.budgeted||0),0)
+    const ts=items.reduce((a,b)=>a+Number(b.spent||0),0)
+    const sur=tb-ts
+
+    // 連動：顯示對應申請計畫的申請金額
+    const planIds=[...new Set(items.map(b=>b.plan_id).filter(Boolean))]
+    const totalApplied=planIds.reduce((a,pid)=>{
+      const p=S.data.plans.find(x=>x.id===pid);return a+Number(p?.amount||0)
+    },0)
+
+    const rows=items.map(b=>{
+      const pct=b.budgeted>0?Math.round(b.spent/b.budgeted*100):0
+      const s=Number(b.budgeted)-Number(b.spent)
+      const bc=pct>100?'ov':cl
+      // 連動：顯示對應計畫名稱
+      const plan=b.plan_id?S.data.plans.find(p=>p.id===b.plan_id):null
+      return `<tr>
+        <td class="code">${esc(b.code)}</td>
+        <td class="name">${esc(b.name)}${plan?`<br><span style="font-size:9px;color:var(--faint)">${esc(plan.name.slice(0,12))}…</span>`:''}</td>
+        <td class="num">$${fmt(b.budgeted)}</td>
+        <td class="num sp ${cl}">$${fmt(b.spent)}</td>
+        <td class="num sur ${s>=0?'pos':'neg'}">$${fmt(s)}</td>
+        <td class="mb-wrap"><div class="mb-bg"><div class="mb-fill ${bc}" style="width:${Math.min(pct,100)}%"></div></div><div class="mb-lbl">${pct}%</div></td>
+        <td class="note">${esc(b.note)||'—'}</td>
+        <td><button class="brow-edit" onclick="openBudgetModal('${b.id}')">✏</button></td>
+      </tr>`
+    }).join('')
+
+    return `<div class="bcard">
+      <div class="bcard-hd" style="background:${pc}08">
+        <span class="btitle ${cl}">${proj==='八福'?'八福創新計畫':'雙福傳道補助'}</span>
+        <div class="bsum">
+          ${totalApplied>0?`<span>申請金額 <b class="${cl}">$${fmt(totalApplied)}</b></span>`:''}
+          <span>預算 <b class="${cl}">$${fmt(tb)}</b></span>
+          <span>支出 <b class="${cl}">$${fmt(ts)}</b></span>
+          <span>結餘 <b class="${sur>=0?'pos':'neg'}">$${fmt(sur)}</b></span>
+          <span style="font-size:10px;color:var(--muted)">執行率 ${tb>0?Math.round(ts/tb*100):0}%</span>
+        </div>
+      </div>
+      <div class="bwrap">
+        <table class="bt">
+          <thead><tr>
+            <th style="text-align:left">代碼</th>
+            <th style="text-align:left">科目 / 計畫</th>
+            <th style="text-align:right">預算金額</th>
+            <th style="text-align:right">實際支出</th>
+            <th style="text-align:right">結餘</th>
+            <th style="text-align:right">執行率</th>
+            <th style="text-align:left">備註</th>
+            <th></th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>`
+  }).join('')
+}
+
+/* ══════════════════════════════════════════════
+   RENDER — MEETINGS（含計畫連動）
+══════════════════════════════════════════════ */
+function meetCard(m, mini=false){
+  const isG=m.project==='八福'
+  const pc=isG?'#14532d':'#1e3a5f'
+  const bg=isG?'#ecfdf5':'#eff6ff'
+  const bd=isG?'#86efac':'#93c5fd'
+  const sMap={completed:['done','已完成'],upcoming:['upcoming','即將召開'],pending:['pending','待定']}
+  const[sc,sl]=sMap[m.status]||sMap.pending
+  // 連動：顯示對應計畫名稱
+  const plan=m.plan_id?S.data.plans.find(p=>p.id===m.plan_id):null
+  return `<div class="mc">
+    <div class="mdate" style="background:${bg};border-color:${bd}">
+      <span class="mmth" style="color:${pc}">${(m.date||'').slice(5,7)}月</span>
+      <span class="mday" style="color:${pc}">${(m.date||'').slice(8,10)}</span>
+    </div>
+    <div class="mi">
+      <div class="mtags">
+        <span class="mproj" style="background:${bg};color:${pc}">${esc(m.project)}</span>
+        ${plan?`<span style="font-size:9.5px;color:var(--muted);background:var(--bg);padding:2px 6px;border-radius:4px;border:1px solid var(--border)">${esc(plan.name.slice(0,10))}…</span>`:''}
+        <span class="mtyp">${esc(m.type)}</span>
+        <span class="mstat ${sc}">${sl}</span>
+      </div>
+      <div class="mtitle">${esc(m.title)}</div>
+      ${m.attendees>0?`<div class="matt">出席 ${m.attendees} 人</div>`:''}
+      ${m.summary?`<div class="msum">${esc(m.summary)}</div>`:''}
+    </div>
+    ${!mini?`<button class="mc-edit" onclick="openMeetModal('${m.id}')">✏ 編輯</button>`:''}
+  </div>`
+}
+
+function renderMeetings(){
+  $('ml').innerHTML=S.data.meetings.map(m=>meetCard(m)).join('')
+}
+
+/* ══════════════════════════════════════════════
+   CRUD — PLANS
+══════════════════════════════════════════════ */
+function openPlanModal(id){
+  const p=id?S.data.plans.find(x=>x.id===id):null
+  S.edit.plan=p
+  const v=k=>esc(p?p[k]||'':'')
+  const sel=(k,opts,def)=>opts.map(o=>`<option ${(p&&p[k]===o)||(!p&&o===def)?'selected':''}>${o}</option>`).join('')
+
+  // 連動預覽：如果是編輯現有計畫，顯示其預算/KPI/會議摘要
+  let linkBoxHtml=''
+  if(p){
+    const bs=planBudgetSummary(p.id)
+    const ks=planKpiSummary(p.id)
+    const ms=planMeetingSummary(p.id)
+    linkBoxHtml=`<div class="plan-link-box">
+      <div class="plb-title">📎 此計畫關聯資料</div>
+      <div class="plan-link-row"><span class="plr-l">預算科目數</span><span class="plr-r" style="color:var(--g2)">${bs.items} 項 · 支出 $${fmt(bs.spent)} / $${fmt(bs.budgeted)}</span></div>
+      <div class="plan-link-row" style="margin-top:4px"><span class="plr-l">KPI 指標數</span><span class="plr-r" style="color:var(--b2)">${ks.count} 項 · 平均達成率 ${ks.avgPct}%</span></div>
+      <div class="plan-link-row" style="margin-top:4px"><span class="plr-l">相關會議數</span><span class="plr-r" style="color:var(--amber)">${ms.count} 場${ms.upcoming>0?` · ${ms.upcoming} 場即將召開`:''}</span></div>
+    </div>`
+  }
+
+  openModal(p?'編輯申請計畫':'新增申請計畫','#14532d',`
+    ${linkBoxHtml}
+    <div class="fg">
+      <div class="ff s2"><label class="fl r">計畫名稱</label><input class="fi" id="f_name" value="${v('name')}" placeholder="請輸入計畫名稱"/></div>
+      <div class="ff"><label class="fl r">申請單位</label><input class="fi" id="f_unit" value="${v('unit')}"/></div>
+      <div class="ff"><label class="fl r">申請金額（元）</label><input class="fi" id="f_amount" type="number" value="${v('amount')}" oninput="updatePlanAmountPreview(this.value)"/></div>
+      <div class="ff"><label class="fl">補助類型</label><select class="fs" id="f_type">${sel('type',['八福','雙福'],'八福')}</select></div>
+      <div class="ff"><label class="fl">目前狀態</label><select class="fs" id="f_status">${sel('status',['申請中','審核中','執行中','結案'],'申請中')}</select></div>
+      <div class="ff"><label class="fl">申請日期</label><input class="fi" id="f_apply_date" type="date" value="${v('apply_date')}"/></div>
+      <div class="ff"><label class="fl">審核日期</label><input class="fi" id="f_review_date" type="date" value="${v('review_date')}"/></div>
+      <div class="ff"><label class="fl">執行開始</label><input class="fi" id="f_start_date" type="date" value="${v('start_date')}"/></div>
+      <div class="ff"><label class="fl">結案日期</label><input class="fi" id="f_close_date" type="date" value="${v('close_date')}"/></div>
+      <div class="ff s2"><label class="fl">備註</label><textarea class="fta" id="f_note">${v('note')}</textarea></div>
+    </div>
+    <div id="amt_preview" style="text-align:right;font-size:11px;color:var(--muted);margin-top:4px">${p?`申請金額：$${fmt(p.amount)}`:''}</div>
+    <div class="fas">
+      <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn btn-g" onclick="savePlan()">💾 儲存</button>
+    </div>`)
+}
+
+function updatePlanAmountPreview(val){
+  const el=$('amt_preview')
+  if(el) el.textContent=val?`申請金額：$${fmt(Number(val))}`:''}
+
+async function savePlan(){
+  function gv(id){const el=document.getElementById(id);return el?el.value.trim():''}
+  const row={name:gv('f_name'),unit:gv('f_unit'),amount:Number(gv('f_amount'))||0,type:gv('f_type'),status:gv('f_status'),apply_date:gv('f_apply_date')||null,review_date:gv('f_review_date')||null,start_date:gv('f_start_date')||null,close_date:gv('f_close_date')||null,note:gv('f_note')}
+  if(!row.name){toast('請填寫計畫名稱','err');return}
+  try{
+    if(!S.edit.plan){
+      const newId=`P${uid()}`
+      const fullRow={id:newId,...row}
+      const d=await API.insert('plans',fullRow)
+      S.data.plans.push({...fullRow,...d})
+      toast('已新增申請計畫 ✓')
+    }else{
+      await API.update('plans',S.edit.plan.id,row)
+      S.data.plans=S.data.plans.map(x=>x.id===S.edit.plan.id?{...x,...row}:x)
+      toast('已更新申請計畫 ✓')
+    }
+    closeModal();renderPipeline();renderBudget();renderKPI();renderMeetings();renderDash()
+  }catch(e){toast('儲存失敗：'+e.message,'err')}
+}
+
+/* ══════════════════════════════════════════════
+   CRUD — RECIPIENTS
+══════════════════════════════════════════════ */
+const DISABILITY=['','肢體障礙（第一類）','肢體障礙（第二類）','視覺障礙（第一類）','視覺障礙（第二類）','聽覺障礙（第一類）','聽覺障礙（第二類）','智能障礙（第一類）','智能障礙（第二類）','多重障礙','精神障礙','其他']
+
+function openRecModal(id){
+  const r=id?S.data.recipients.find(x=>x.id===id):null
+  S.edit.rec=r
+  const v=k=>esc(r?r[k]||'':'')
+  const sel=(k,opts,def)=>opts.map(o=>`<option ${(r&&r[k]===o)||(!r&&o===def)?'selected':''}>${o}</option>`).join('')
+  openModal(r?'編輯補助對象':'新增補助對象','#1e3a5f',`
+    <div class="fg">
+      <div class="ff"><label class="fl">身份類別</label><select class="fs" id="f_category">${sel('category',['傳道人','神學生'],'傳道人')}</select></div>
+      <div class="ff"><label class="fl">補助狀態</label><select class="fs" id="f_status">${sel('status',['補助中','申請中','已結案'],'補助中')}</select></div>
+      <div class="ff"><label class="fl r">姓名</label><input class="fi" id="f_name" value="${v('name')}"/></div>
+      <div class="ff"><label class="fl r">所屬教會</label><input class="fi" id="f_church" value="${v('church')}"/></div>
+      <div class="ff s2"><label class="fl">身心障礙類別</label>
+        <select class="fs" id="f_disability">${DISABILITY.map(d=>`<option value="${esc(d)}" ${r&&r.disability===d?'selected':''}>${d||'請選擇'}</option>`).join('')}</select>
+      </div>
+      <div class="ff s2"><label class="fl r">現況詳述</label><textarea class="fta" id="f_situation" style="min-height:84px">${v('situation')}</textarea></div>
+      <div class="ff s2"><label class="fl r">第一次福音合作活動</label><textarea class="fta" id="f_gospel1">${v('gospel1')}</textarea></div>
+      <div class="ff s2"><label class="fl r">第二次福音合作活動</label><textarea class="fta" id="f_gospel2">${v('gospel2')}</textarea></div>
+      <div class="ff s2"><label class="fl r">代禱事項</label><textarea class="fta" id="f_prayer">${v('prayer')}</textarea></div>
+    </div>
+    <div class="fas">
+      <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn btn-b" onclick="saveRec()">💾 儲存</button>
+    </div>`)
+}
+
+async function saveRec(){
+  function gv(id){const el=document.getElementById(id);return el?el.value.trim():''}
+  const row={id:S.edit.rec?S.edit.rec.id:`R${uid()}`,category:gv('f_category'),name:gv('f_name'),church:gv('f_church'),disability:gv('f_disability'),situation:gv('f_situation'),gospel1:gv('f_gospel1'),gospel2:gv('f_gospel2'),prayer:gv('f_prayer'),status:gv('f_status')}
+  if(!row.name){toast('請填寫姓名','err');return}
+  try{
+    if(!S.edit.rec){const d=await API.insert('recipients',row);S.data.recipients.push({...row,...d});toast('已新增補助對象 ✓')}
+    else{await API.update('recipients',S.edit.rec.id,row);S.data.recipients=S.data.recipients.map(x=>x.id===S.edit.rec.id?{...x,...row}:x);toast('已更新補助對象 ✓')}
+    closeModal();renderRecipients();renderDash()
+  }catch(e){toast('儲存失敗：'+e.message,'err')}
+}
+
+/* ══════════════════════════════════════════════
+   CRUD — KPI（含計畫下拉選單連動）
+══════════════════════════════════════════════ */
+function openKpiModal(id){
+  const k=id?S.data.kpis.find(x=>x.id===id):null
+  S.edit.kpi=k
+  const v=key=>esc(k?k[key]||'':'')
+  const sel=(key,opts,def)=>opts.map(o=>`<option ${(k&&k[key]===o)||(!k&&o===def)?'selected':''}>${o}</option>`).join('')
+
+  // 連動：計畫下拉選單（依類型分組）
+  const planOpts=S.data.plans.map(p=>`<option value="${esc(p.id)}" ${k&&k.plan_id===p.id?'selected':''}>[${p.type}] ${esc(p.name.slice(0,18))}</option>`).join('')
+
+  openModal(k?'編輯 KPI 指標':'新增 KPI 指標','#b45309',`
+    <div class="fg">
+      <div class="ff"><label class="fl r">所屬專案</label>
+        <select class="fs" id="f_project" onchange="syncKpiProjectFromPlan()">${sel('project',['八福','雙福'],'八福')}</select>
+      </div>
+      <div class="ff"><label class="fl">對應申請計畫</label>
+        <select class="fs" id="f_plan_id">
+          <option value="">-- 不指定 --</option>
+          ${planOpts}
+        </select>
+      </div>
+      <div class="ff s2"><label class="fl r">KPI 名稱</label><input class="fi" id="f_name" value="${v('name')}" placeholder="如：受益人次"/></div>
+      <div class="ff"><label class="fl r">目標值</label><input class="fi" id="f_target" type="number" value="${v('target')}"/></div>
+      <div class="ff"><label class="fl r">實際值</label><input class="fi" id="f_current" type="number" value="${v('current')}" oninput="previewKpiPct()"/></div>
+      <div class="ff"><label class="fl r">單位</label><input class="fi" id="f_unit" value="${v('unit')}" placeholder="人次、場、間…"/></div>
+      <div class="ff"><label class="fl">更新日期</label><input class="fi" id="f_updated_at" type="date" value="${v('updated_at')||new Date().toISOString().slice(0,10)}"/></div>
+      <div class="ff" id="kpi_pct_preview" style="align-self:flex-end">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:4px">達成率預覽</div>
+        <div id="kpi_pct_val" style="font-family:'Noto Serif TC',serif;font-size:22px;font-weight:900;color:var(--g2)">
+          ${k&&k.target>0?Math.round(k.current/k.target*100)+'%':'–'}
+        </div>
+      </div>
+    </div>
+    <div class="fas">
+      <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      ${k?`<button class="btn btn-ghost" onclick="deleteKpi('${k.id}')" style="color:var(--red);border-color:var(--red)">🗑 刪除</button>`:''}
+      <button class="btn btn-am" onclick="saveKpi()">💾 儲存</button>
+    </div>`)
+}
+
+function previewKpiPct(){
+  const curEl=document.getElementById('f_current')
+  const tgtEl=document.getElementById('f_target')
+  const el=document.getElementById('kpi_pct_val');if(!el)return
+  const cur=Number(curEl?.value||0)
+  const tgt=Number(tgtEl?.value||0)
+  if(tgt>0){
+    const pct=Math.round(cur/tgt*100)
+    el.textContent=pct+'%'
+    el.style.color=pct<58?'#dc2626':pct>=68?'#16a34a':'#d97706'
+  }else{el.textContent='–'}
+}
+
+function syncKpiProjectFromPlan(){
+  const planId=document.getElementById('f_plan_id')?.value
+  if(planId){
+    const plan=S.data.plans.find(p=>p.id===planId)
+    if(plan){const sel=document.getElementById('f_project');if(sel)sel.value=plan.type}
+  }
+}
+
+async function saveKpi(){
+  function gv(id){const el=document.getElementById(id);return el?el.value.trim():''}
+  const planIdRaw=gv('f_plan_id')
+  const row={
+    project:     gv('f_project')||'八福',
+    plan_id:     (planIdRaw&&planIdRaw!=='')?planIdRaw:null,
+    name:        gv('f_name'),
+    target:      Number(gv('f_target'))||0,
+    current:     Number(gv('f_current'))||0,
+    unit:        gv('f_unit')||'次',
+    updated_at:  gv('f_updated_at')||new Date().toISOString().slice(0,10)
+  }
+  if(!row.name)  {toast('請填寫 KPI 名稱','err');return}
+  if(!row.target){toast('請填寫目標值','err');return}
+  try{
+    if(!S.edit.kpi){
+      row.id=`K${uid()}`
+      const d=await API.insert('kpis',row)
+      S.data.kpis.push({...row,...d})
+      toast('已新增 KPI ✓')
+    }else{
+      await API.update('kpis',S.edit.kpi.id,row)
+      S.data.kpis=S.data.kpis.map(x=>x.id===S.edit.kpi.id?{...x,...row}:x)
+      toast('已更新 KPI ✓')
+    }
+    closeModal();renderKPI();renderPipeline();renderDash()
+  }catch(e){toast('儲存失敗：'+e.message,'err');console.error(e)}
+}
+
+async function deleteKpi(id){
+  if(!confirm('確定要刪除此 KPI 指標？'))return
+  try{
+    await API.remove('kpis',id)
+    S.data.kpis=S.data.kpis.filter(x=>x.id!==id)
+    toast('已刪除 KPI','info');closeModal();renderKPI();renderPipeline();renderDash()
+  }catch(e){toast('刪除失敗：'+e.message,'err')}
+}
+
+/* ══════════════════════════════════════════════
+   CRUD — BUDGET（含計畫下拉選單連動）
+══════════════════════════════════════════════ */
+function openBudgetModal(id){
+  const b=id?S.data.budget.find(x=>x.id===id):null
+  S.edit.budget=b
+  const v=k=>esc(b?b[k]||'':'')
+  const sel=(k,opts,def)=>opts.map(o=>`<option ${(b&&b[k]===o)||(!b&&o===def)?'selected':''}>${o}</option>`).join('')
+
+  // 連動：計畫下拉選單
+  const planOpts=S.data.plans.map(p=>`<option value="${esc(p.id)}" ${b&&b.plan_id===p.id?'selected':''}>[${p.type}] ${esc(p.name.slice(0,18))}</option>`).join('')
+
+  // 結餘預覽
+  const budgeted=Number(b?.budgeted||0)
+  const spent=Number(b?.spent||0)
+
+  openModal(b?'編輯預算科目':'新增預算科目','#b45309',`
+    <div class="fg">
+      <div class="ff"><label class="fl r">所屬專案</label>
+        <select class="fs" id="f_project">${sel('project',['八福','雙福'],'八福')}</select>
+      </div>
+      <div class="ff"><label class="fl">對應申請計畫</label>
+        <select class="fs" id="f_plan_id" onchange="syncBudgetProjectFromPlan()">
+          <option value="">-- 不指定 --</option>
+          ${planOpts}
+        </select>
+      </div>
+      <div class="ff"><label class="fl r">科目代碼</label><input class="fi" id="f_code" value="${v('code')}" placeholder="5110"/></div>
+      <div class="ff"><label class="fl r">科目名稱</label><input class="fi" id="f_name" value="${v('name')}" placeholder="車馬費"/></div>
+      <div class="ff"><label class="fl r">預算金額（元）</label><input class="fi" id="f_budgeted" type="number" value="${v('budgeted')}" oninput="previewBudgetSurplus()"/></div>
+      <div class="ff"><label class="fl r">實際支出（元）</label><input class="fi" id="f_spent" type="number" value="${v('spent')}" oninput="previewBudgetSurplus()"/></div>
+      <div class="ff s2"><label class="fl">備註</label><input class="fi" id="f_note" value="${v('note')}"/></div>
+    </div>
+    <div id="budget_preview" style="background:var(--bg);border-radius:8px;padding:10px 13px;margin-top:8px;display:flex;gap:16px;font-size:11.5px">
+      <span>結餘：<b id="bp_surplus" style="font-family:'Noto Serif TC',serif;font-size:14px;color:${budgeted-spent>=0?'#15803d':'#dc2626'}">${budgeted>0||spent>0?'$'+fmt(budgeted-spent):'–'}</b></span>
+      <span>執行率：<b id="bp_pct" style="color:var(--g2)">${budgeted>0?Math.round(spent/budgeted*100)+'%':'–'}</b></span>
+    </div>
+    <div class="fas">
+      <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      ${b?`<button class="btn btn-ghost" onclick="deleteBudget('${b.id}')" style="color:var(--red);border-color:var(--red)">🗑 刪除</button>`:''}
+      <button class="btn btn-am" onclick="saveBudget()">💾 儲存</button>
+    </div>`)
+}
+
+function previewBudgetSurplus(){
+  const bgEl=document.getElementById('f_budgeted')
+  const spEl=document.getElementById('f_spent')
+  const surEl=document.getElementById('bp_surplus')
+  const pctEl=document.getElementById('bp_pct')
+  const bg=Number(bgEl?.value||0)
+  const sp=Number(spEl?.value||0)
+  const sur=bg-sp,pct=bg>0?Math.round(sp/bg*100):0
+  if(surEl){surEl.textContent='$'+fmt(sur);surEl.style.color=sur>=0?'#15803d':'#dc2626'}
+  if(pctEl){pctEl.textContent=bg>0?pct+'%':'–'}
+}
+
+function syncBudgetProjectFromPlan(){
+  const planId=document.getElementById('f_plan_id')?.value
+  if(planId){const plan=S.data.plans.find(p=>p.id===planId);if(plan){const sel=document.getElementById('f_project');if(sel)sel.value=plan.type}}
+}
+
+async function saveBudget(){
+  function gv(id){const el=document.getElementById(id);return el?el.value.trim():''}
+  const planIdRaw2=gv('f_plan_id')
+  const row={
+    project:  gv('f_project')||'八福',
+    plan_id:  (planIdRaw2&&planIdRaw2!=='')?planIdRaw2:null,
+    code:     gv('f_code'),
+    name:     gv('f_name'),
+    budgeted: Number(gv('f_budgeted'))||0,
+    spent:    Number(gv('f_spent'))||0,
+    note:     gv('f_note')||''
+  }
+  if(!row.name){toast('請填寫科目名稱','err');return}
+  try{
+    if(!S.edit.budget){
+      row.id=`BU${uid()}`
+      const d=await API.insert('budget',row)
+      S.data.budget.push({...row,...d})
+      toast('已新增預算科目 ✓')
+    }else{
+      await API.update('budget',S.edit.budget.id,row)
+      S.data.budget=S.data.budget.map(x=>x.id===S.edit.budget.id?{...x,...row}:x)
+      toast('已更新預算科目 ✓')
+    }
+    closeModal();renderBudget();renderPipeline();renderDash()
+  }catch(e){toast('儲存失敗：'+e.message,'err');console.error(e)}
+}
+
+async function deleteBudget(id){
+  if(!confirm('確定要刪除此預算科目？'))return
+  try{
+    await API.remove('budget',id)
+    S.data.budget=S.data.budget.filter(x=>x.id!==id)
+    toast('已刪除預算科目','info');closeModal();renderBudget();renderPipeline();renderDash()
+  }catch(e){toast('刪除失敗：'+e.message,'err')}
+}
+
+/* ══════════════════════════════════════════════
+   CRUD — MEETINGS（含計畫下拉選單連動）
+══════════════════════════════════════════════ */
+function openMeetModal(id){
+  const m=id?S.data.meetings.find(x=>x.id===id):null
+  S.edit.meeting=m
+  const v=k=>esc(m?m[k]||'':'')
+  const sel=(k,opts,def)=>opts.map(o=>`<option ${(m&&m[k]===o)||(!m&&o===def)?'selected':''}>${o}</option>`).join('')
+
+  // 連動：計畫下拉選單
+  const planOpts=S.data.plans.map(p=>`<option value="${esc(p.id)}" ${m&&m.plan_id===p.id?'selected':''}>[${p.type}] ${esc(p.name.slice(0,18))}</option>`).join('')
+
+  openModal(m?'編輯會議紀錄':'新增會議紀錄','#b45309',`
+    <div class="fg">
+      <div class="ff"><label class="fl r">所屬專案</label>
+        <select class="fs" id="f_project">${sel('project',['八福','雙福'],'八福')}</select>
+      </div>
+      <div class="ff"><label class="fl">對應申請計畫</label>
+        <select class="fs" id="f_plan_id" onchange="syncMeetProjectFromPlan()">
+          <option value="">-- 不指定 --</option>
+          ${planOpts}
+        </select>
+      </div>
+      <div class="ff"><label class="fl r">會議日期</label><input class="fi" id="f_date" type="date" value="${v('date')||new Date().toISOString().slice(0,10)}"/></div>
+      <div class="ff"><label class="fl r">會議類型</label>
+        <select class="fs" id="f_type">${sel('type',['審查會議','期中報告','成果報告','工作會議','其他'],'審查會議')}</select>
+      </div>
+      <div class="ff s2"><label class="fl r">會議標題</label><input class="fi" id="f_title" value="${v('title')}" placeholder="如：第一次審查小組會議"/></div>
+      <div class="ff"><label class="fl">出席人數</label><input class="fi" id="f_attendees" type="number" value="${v('attendees')||0}" min="0"/></div>
+      <div class="ff"><label class="fl r">狀態</label>
+        <select class="fs" id="f_status">${sel('status',['upcoming','completed','pending'],'upcoming')}</select>
+      </div>
+      <div class="ff s2"><label class="fl">會議摘要</label><textarea class="fta" id="f_summary">${v('summary')}</textarea></div>
+    </div>
+    <div class="fas">
+      <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      ${m?`<button class="btn btn-ghost" onclick="deleteMeet('${m.id}')" style="color:var(--red);border-color:var(--red)">🗑 刪除</button>`:''}
+      <button class="btn btn-am" onclick="saveMeet()">💾 儲存</button>
+    </div>`)
+}
+
+function syncMeetProjectFromPlan(){
+  const planId=document.getElementById('f_plan_id')?.value
+  if(planId){const plan=S.data.plans.find(p=>p.id===planId);if(plan){const sel=document.getElementById('f_project');if(sel)sel.value=plan.type}}
+}
+
+async function saveMeet(){
+  function gv(id){const el=document.getElementById(id);return el?el.value.trim():''}
+  const planIdRaw3=gv('f_plan_id')
+  const row={
+    project:   gv('f_project')||'八福',
+    plan_id:   (planIdRaw3&&planIdRaw3!=='')?planIdRaw3:null,
+    date:      gv('f_date')||null,
+    type:      gv('f_type')||'審查會議',
+    title:     gv('f_title'),
+    attendees: Number(gv('f_attendees'))||0,
+    status:    gv('f_status')||'pending',
+    summary:   gv('f_summary')||''
+  }
+  if(!row.title){toast('請填寫會議標題','err');return}
+  try{
+    if(!S.edit.meeting){
+      row.id=`M${uid()}`
+      const d=await API.insert('meetings',row)
+      S.data.meetings.push({...row,...d})
+      toast('已新增會議紀錄 ✓')
+    }else{
+      await API.update('meetings',S.edit.meeting.id,row)
+      S.data.meetings=S.data.meetings.map(x=>x.id===S.edit.meeting.id?{...x,...row}:x)
+      toast('已更新會議紀錄 ✓')
+    }
+    closeModal();renderMeetings();renderPipeline();renderDash()
+  }catch(e){toast('儲存失敗：'+e.message,'err');console.error(e)}
+}
+
+async function deleteMeet(id){
+  if(!confirm('確定要刪除此會議紀錄？'))return
+  try{
+    await API.remove('meetings',id)
+    S.data.meetings=S.data.meetings.filter(x=>x.id!==id)
+    toast('已刪除會議紀錄','info');closeModal();renderMeetings();renderPipeline();renderDash()
+  }catch(e){toast('刪除失敗：'+e.message,'err')}
+}
+
+/* ══════════════════════════════════════════════
+   SETUP PAGE
+══════════════════════════════════════════════ */
+const SQL=`-- 在 Supabase SQL Editor 貼上並執行
+
+create table plans (
+  id text primary key,
+  name text not null,
+  unit text,
+  amount numeric default 0,
+  type text,
+  status text,
+  apply_date date,
+  review_date date,
+  start_date date,
+  close_date date,
+  note text,
+  created_at timestamptz default now()
+);
+
+create table recipients (
+  id text primary key,
+  category text,
+  name text not null,
+  church text,
+  disability text,
+  situation text,
+  gospel1 text,
+  gospel2 text,
+  prayer text,
+  status text default '補助中',
+  created_at timestamptz default now()
+);
+
+create table kpis (
+  id text primary key,
+  project text,
+  plan_id text references plans(id),
+  name text,
+  target numeric,
+  current numeric,
+  unit text,
+  updated_at date default now()
+);
+
+create table budget (
+  id text primary key,
+  project text,
+  plan_id text references plans(id),
+  code text,
+  name text,
+  budgeted numeric default 0,
+  spent numeric default 0,
+  note text
+);
+
+create table meetings (
+  id text primary key,
+  project text,
+  plan_id text references plans(id),
+  date date,
+  type text,
+  title text,
+  attendees int default 0,
+  status text default 'pending',
+  summary text
+);
+
+-- 開放存取（測試用）
+alter table plans enable row level security;
+alter table recipients enable row level security;
+alter table kpis enable row level security;
+alter table budget enable row level security;
+alter table meetings enable row level security;
+
+create policy "public access" on plans for all using (true) with check (true);
+create policy "public access" on recipients for all using (true) with check (true);
+create policy "public access" on kpis for all using (true) with check (true);
+create policy "public access" on budget for all using (true) with check (true);
+create policy "public access" on meetings for all using (true) with check (true);`
+
+function renderSetup(){
+  const steps=[
+    {n:'1',t:'建立免費 Supabase 專案',d:'前往 supabase.com → Start your project → GitHub 帳號登入 → New Project → 填入名稱與密碼 → 選 Singapore 區域 → Create New Project。',chips:[]},
+    {n:'2',t:'建立資料表（執行 SQL）',d:'左側選單 → SQL Editor → New query → 貼上下方 SQL → 點 RUN 執行。5 張資料表及關聯外鍵自動建立完成，注意：plans 資料表必須先有資料，kpis / budget / meetings 才能透過 plan_id 關聯。',chips:[]},
+    {n:'3',t:'複製 API 金鑰',d:'左側選單 → Settings → API → 複製 Project URL 和 anon / public 金鑰。',chips:[]},
+    {n:'4',t:'修改網站頂端設定',d:'用記事本開啟 index.html → 找到 SB_URL / SB_KEY → 貼入值 → USE_MOCK 改為 false → 存檔，重新上傳即連線。',chips:[]},
+    {n:'5',t:'上傳至 GitHub Pages 或 Netlify',d:'將 index.html 上傳至 GitHub → 開啟 Pages，或直接拖放至 Netlify 部署頁面。30 秒上線，往後在 Supabase 後台直接管理資料。',chips:[]},
+  ]
+  $('setupSteps').innerHTML=steps.map(s=>`
+    <div class="ss">
+      <div class="sn">${s.n}</div>
+      <div class="sb2"><div class="st">${s.t}</div><div class="sd">${esc(s.d)}</div></div>
+    </div>`).join('')
+  +`<div class="code-wrap" style="margin-top:4px">
+    <div class="code-hd">
+      <span class="code-lang">SQL · 資料表建立腳本（含外鍵關聯）</span>
+      <button class="cpbtn" id="cpbtn" onclick="copySQL()">複製 SQL</button>
+    </div>
+    <pre class="code">${esc(SQL)}</pre>
+  </div>`
+}
+function copySQL(){
+  navigator.clipboard.writeText(SQL).then(()=>{
+    const b=$('cpbtn');if(!b)return
+    b.textContent='✓ 已複製';b.classList.add('ok')
+    setTimeout(()=>{b.textContent='複製 SQL';b.classList.remove('ok')},2500)
+  })
+}
+
+/* ══════════════════════════════════════════════
+   RENDER ALL
+══════════════════════════════════════════════ */
+function renderAll(){
+  renderDash();renderPipeline();renderRecipients()
+  renderKPI();renderBudget();renderMeetings();renderSetup()
+  goPage(S.page)
+}
+
+/* ══════════════════════════════════════════════
+   BOOT
+══════════════════════════════════════════════ */
+document.addEventListener('DOMContentLoaded',()=>{
+  document.querySelectorAll('.nb').forEach(b=>b.addEventListener('click',()=>goPage(b.dataset.p)))
+  $('burger').addEventListener('click',()=>$('sb').classList.contains('open')?closeSb():openSb())
+  $('ovl').addEventListener('click',closeSb)
+  $('mclose').addEventListener('click',closeModal)
+  $('mbg').addEventListener('click',e=>{if(e.target===$('mbg'))closeModal()})
+  $('refBtn').addEventListener('click',async()=>{
+    $('refBtn').textContent='↻ 載入中…'
+    await loadAll()
+    $('refBtn').textContent='↻ 重新整理資料'
+    toast('資料已更新','info')
+  })
+  initAuth()
+})
+</script>
+</body>
+</html>
